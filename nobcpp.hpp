@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -8,7 +9,6 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-#include <algorithm>
 
 inline void rebuild_self(const std::string& source_filename, int argc, char** argv,
                          const std::vector<std::string>& deps = {})
@@ -98,10 +98,15 @@ class Unit
         if (target_path)
         {
             std::filesystem::create_directories(std::filesystem::path(*target_path).parent_path());
-            std::cout << *target_path << " has dependency on headers: " << std::endl;
-            for (const auto& header_dep : header_deps)
+            if (!header_deps.empty())
             {
-                std::cout << "\t" << header_dep << std::endl;
+
+                std::cout << *target_path << " has dependency on headers: ";
+                for (const auto& header_dep : header_deps)
+                {
+                    std::cout << header_dep << ", ";
+                }
+                std::cout << std::endl;
             }
             if (source_path)
             {
@@ -241,7 +246,6 @@ inline std::unique_ptr<Unit> build_tree_from_cpp_files(const std::filesystem::pa
                 obj_path.parent_path().string() + "/" + obj_path.stem().string() + ".d";
             if (std::filesystem::exists(header_deps_path))
             {
-                std::cout << "Found .d file: " << header_deps_path << std::endl;
                 const auto header_deps = parse_dependency_file(header_deps_path);
                 for (const auto& header_dep : header_deps)
                 {
