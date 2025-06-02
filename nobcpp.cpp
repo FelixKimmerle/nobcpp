@@ -11,6 +11,10 @@ int main(int argc, char** argv)
     // test->add_dep(std::make_unique<Unit>("src/test.hpp"));
     // root.add_dep(std::move(test));
     // root.print_depth();
-    const auto tree = build_tree_from_cpp_files("src/", "build/target.exe");
-    tree->print_depth();
+    const auto tree_1 = build_tree_from_cpp_files("src/project_1/", "build/project_1/target.exe");
+    tree_1->print_depth();
+    tree_1->compile();
+    const auto tree_2 = build_tree_from_cpp_files("src/project_2/", "build/project_2/target.exe");
+    tree_2->print_depth();
+    tree_2->compile();
 }
