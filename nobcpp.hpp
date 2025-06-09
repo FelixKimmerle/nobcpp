@@ -1,12 +1,14 @@
 #pragma once
-#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -46,6 +48,107 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
     std::cout << "nothing todo!" << std::endl;
 }
 
+class CompileCommand
+{
+  private:
+    std::string command;
+    std::vector<std::string> args;
+    bool enabled;
+
+  public:
+    friend std::ostream& operator<<(std::ostream& os, const CompileCommand& cc)
+    {
+        os << cc.command << " ";
+        for (const auto& arg : cc.args)
+        {
+            os << arg << " ";
+        }
+        os << " enabled: " << cc.enabled;
+        return os;
+    }
+    CompileCommand(const std::string& command, const std::vector<std::string> args, bool enabled)
+        : command(command), args(args), enabled(enabled)
+    {
+    }
+
+    bool is_enabled() const
+    {
+        return enabled;
+    }
+    int execute() const
+    {
+        if (!enabled)
+        {
+            return 0;
+        }
+        std::stringstream ss;
+        ss << command << " ";
+        for (const auto& arg : args)
+        {
+            ss << arg << " ";
+        }
+        return std::system(ss.str().c_str());
+    }
+};
+
+class CompileCommands
+{
+  private:
+    std::vector<std::vector<CompileCommand>> commands;
+
+  public:
+    void add_cmd(size_t depth, const CompileCommand& compile_command)
+    {
+        while (commands.size() <= depth)
+        {
+            commands.emplace_back();
+        }
+
+        commands[depth].push_back(compile_command);
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands)
+    {
+        size_t level = 0;
+        for (const auto& cc : compile_commands.commands)
+        {
+            std::cout << "Level: " << level++ << std::endl;
+            for (const auto& c : cc)
+            {
+                std::cout << c << std::endl;
+            }
+        }
+
+        return os;
+    }
+
+    void execute() const
+    {
+        for (const auto& compile_level : std::views::reverse(commands))
+        {
+            std::vector<std::future<int>> jobs;
+            for (const auto& cmd : compile_level)
+            {
+                if (cmd.is_enabled())
+                {
+                    jobs.push_back(std::async(std::launch::async, [cmd]() {
+                        std::cout << "Running: " << cmd << "\n";
+                        return cmd.execute();
+                    }));
+                }
+            }
+            for (auto& job : jobs)
+            {
+                if (job.get() != 0)
+                {
+                    std::cerr << "Command failed.\n";
+                    std::exit(1);
+                }
+            }
+        }
+    }
+};
+
 class Unit
 {
   private:
@@ -77,11 +180,12 @@ class Unit
         std::cout << std::endl;
     }
 
-    void compile_impl() const
+    bool compile_impl(CompileCommands& compile_commands, int depth) const
     {
         // Recurse into dependencies
         std::vector<std::string> dep_targets;
         std::vector<std::string> header_deps;
+        bool parent_rebuild = false;
         for (const auto& dep : deps)
         {
             if (dep->target_path)
@@ -92,12 +196,14 @@ class Unit
             {
                 header_deps.push_back(*dep->source_path);
             }
-            dep->compile_impl();
+            bool rebuild = dep->compile_impl(compile_commands, depth + 1);
+            parent_rebuild |= rebuild;
         }
 
         if (target_path)
         {
             std::filesystem::create_directories(std::filesystem::path(*target_path).parent_path());
+            bool rebuild = parent_rebuild || !std::filesystem::exists(*target_path);
             if (!header_deps.empty())
             {
 
@@ -105,34 +211,37 @@ class Unit
                 for (const auto& header_dep : header_deps)
                 {
                     std::cout << header_dep << ", ";
+                    rebuild = rebuild || std::filesystem::last_write_time(header_dep) >
+                                             std::filesystem::last_write_time(*target_path);
                 }
                 std::cout << std::endl;
             }
             if (source_path)
             {
-                std::string cmd = "c++ -MMD -c -std=c++23 -O3 -o " + *target_path + " " + *source_path;
-                int ret = std::system(cmd.c_str());
-                if (ret != 0)
-                {
-                    std::cerr << "Compilation failed (exit = " << ret << ")\n";
-                    exit(ret);
-                }
+                rebuild = rebuild || std::filesystem::last_write_time(*source_path) >
+                                         std::filesystem::last_write_time(*target_path);
+                // .cpp -> .o compiling
+                compile_commands.add_cmd(
+                    depth, CompileCommand("c++", {"-MMD", "-c", "-std=c++23", "-O3", "-o", *target_path, *source_path},
+                                          rebuild));
             }
             else
             {
-                std::string cmd = "c++ -MMD -std=c++23 -O3 -o " + *target_path + " ";
+                // .o -> .exe linking
+                std::vector<std::string> args = {"-MMD", "-std=c++23", "-O3", "-o", *target_path};
+
                 for (const auto target : dep_targets)
                 {
-                    cmd += target + " ";
+                    args.push_back(target);
+                    rebuild = rebuild ||
+                              std::filesystem::last_write_time(target) > std::filesystem::last_write_time(*target_path);
                 }
-                int ret = std::system(cmd.c_str());
-                if (ret != 0)
-                {
-                    std::cerr << "Compilation failed (exit = " << ret << ")\n";
-                    exit(ret);
-                }
+
+                compile_commands.add_cmd(depth, CompileCommand("c++", args, rebuild));
             }
+            return rebuild;
         }
+        return false;
     }
 
   public:
@@ -151,9 +260,12 @@ class Unit
         print_depth_impl(0);
     }
 
-    void compile()
+    CompileCommands compile(int depth = 0)
     {
-        compile_impl();
+        CompileCommands compile_commands;
+        compile_impl(compile_commands, depth);
+
+        return compile_commands;
     }
 };
 

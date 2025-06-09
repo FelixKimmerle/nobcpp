@@ -13,8 +13,12 @@ int main(int argc, char** argv)
     // root.print_depth();
     const auto tree_1 = build_tree_from_cpp_files("src/project_1/", "build/project_1/target.exe");
     tree_1->print_depth();
-    tree_1->compile();
+    CompileCommands cc_1 = tree_1->compile();
+    std::cout << cc_1 << std::endl;
+    cc_1.execute();
     const auto tree_2 = build_tree_from_cpp_files("src/project_2/", "build/project_2/target.exe");
     tree_2->print_depth();
-    tree_2->compile();
+    CompileCommands cc_2 = tree_2->compile();
+    std::cout << cc_2 << std::endl;
+    cc_2.execute();
 }
