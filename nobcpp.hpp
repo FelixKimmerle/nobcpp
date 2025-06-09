@@ -12,6 +12,13 @@
 #include <unistd.h>
 #include <vector>
 
+enum class TargetType
+{
+    EXECUTABLE,
+    STATIC_LIB,
+    DYNAMIC_LIB
+};
+
 inline void rebuild_self(const std::string& source_filename, int argc, char** argv,
                          const std::vector<std::string>& deps = {})
 {
@@ -30,9 +37,10 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
 
     if (needs_recompile)
     {
+
         std::cout << "Rebuilding: " << bin << "...\n";
         std::string temp_bin = bin.string() + ".new";
-        std::string cmd = "c++ -std=c++23 -O3 -o " + bin.string() + " " + src.string();
+        std::string cmd = "c++ -std=c++23 -Wall -Wextra -Wpedantic -O3 -o " + bin.string() + " " + src.string();
         int ret = std::system(cmd.c_str());
         if (ret != 0)
         {
@@ -41,7 +49,16 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
         }
 
         std::rename(temp_bin.c_str(), bin.string().c_str());
-        execv(bin.c_str(), argv);
+        std::vector<char*> new_argv;
+        new_argv.push_back(argv[0]);
+        std::string flag = "--recompiled";
+        new_argv.push_back(const_cast<char*>(flag.c_str()));
+        for (int i = 1; i < argc; ++i)
+        {
+            new_argv.push_back(argv[i]);
+        }
+        new_argv.push_back(nullptr);
+        execv(bin.c_str(), new_argv.data());
         perror("execv");
         exit(1);
     }
@@ -180,7 +197,8 @@ class Unit
         std::cout << std::endl;
     }
 
-    bool compile_impl(CompileCommands& compile_commands, int depth) const
+    bool compile_impl(CompileCommands& compile_commands, int depth, const TargetType target_type,
+                      const bool full_rebuild) const
     {
         // Recurse into dependencies
         std::vector<std::string> dep_targets;
@@ -196,7 +214,7 @@ class Unit
             {
                 header_deps.push_back(*dep->source_path);
             }
-            bool rebuild = dep->compile_impl(compile_commands, depth + 1);
+            bool rebuild = dep->compile_impl(compile_commands, depth + 1, target_type, full_rebuild);
             parent_rebuild |= rebuild;
         }
 
@@ -220,15 +238,34 @@ class Unit
             {
                 rebuild = rebuild || std::filesystem::last_write_time(*source_path) >
                                          std::filesystem::last_write_time(*target_path);
+
+                std::vector<std::string> args;
+
+                if (target_type == TargetType::DYNAMIC_LIB)
+                {
+                    args.push_back("-fPIC");
+                }
+                args.insert(args.end(), {"-MMD", "-c", "-std=c++23", "-O3", "-o", *target_path, *source_path});
                 // .cpp -> .o compiling
-                compile_commands.add_cmd(
-                    depth, CompileCommand("c++", {"-MMD", "-c", "-std=c++23", "-O3", "-o", *target_path, *source_path},
-                                          rebuild));
+                compile_commands.add_cmd(depth, CompileCommand("c++", args, rebuild || full_rebuild));
             }
             else
             {
                 // .o -> .exe linking
-                std::vector<std::string> args = {"-MMD", "-std=c++23", "-O3", "-o", *target_path};
+                std::vector<std::string> args;
+
+                std::string compiler = "c++";
+                if (target_type == TargetType::DYNAMIC_LIB)
+                {
+                    args.push_back("-shared");
+                }
+                else if (target_type == TargetType::STATIC_LIB)
+                {
+                    compiler = "ar rcs";
+                }
+
+                args.push_back("-o");
+                args.push_back(*target_path);
 
                 for (const auto target : dep_targets)
                 {
@@ -237,7 +274,7 @@ class Unit
                               std::filesystem::last_write_time(target) > std::filesystem::last_write_time(*target_path);
                 }
 
-                compile_commands.add_cmd(depth, CompileCommand("c++", args, rebuild));
+                compile_commands.add_cmd(depth, CompileCommand(compiler, args, rebuild || full_rebuild));
             }
             return rebuild;
         }
@@ -260,10 +297,20 @@ class Unit
         print_depth_impl(0);
     }
 
-    CompileCommands compile(int depth = 0)
+    CompileCommands compile(bool rebuild, int depth = 0)
     {
         CompileCommands compile_commands;
-        compile_impl(compile_commands, depth);
+        TargetType target_type = TargetType::EXECUTABLE;
+        std::string extension = std::filesystem::path(*target_path).extension();
+        if (extension == ".a")
+        {
+            target_type = TargetType::STATIC_LIB;
+        }
+        else if (extension == ".so")
+        {
+            target_type = TargetType::DYNAMIC_LIB;
+        }
+        compile_impl(compile_commands, depth, target_type, rebuild);
 
         return compile_commands;
     }
