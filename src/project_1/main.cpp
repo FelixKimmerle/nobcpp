@@ -10,5 +10,5 @@ int main()
     bar();
     test();
     greet();
-    std::cout << my_add(5, 4) << std::endl;
+    std::cout << my_add(8, 4) << std::endl;
 }

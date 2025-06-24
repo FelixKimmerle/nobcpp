@@ -4,5 +4,5 @@
 int my_add(int a, int b)
 {
     std::cout << "Hallo hallo project 2" << std::endl;
-    return a + b;
+    return a * b;
 }

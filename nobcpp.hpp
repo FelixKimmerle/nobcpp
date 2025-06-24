@@ -225,7 +225,6 @@ class Unit
         local_compile_flags.insert(local_compile_flags.end(), compile_flags.begin(), compile_flags.end());
         // Recurse into dependencies
         std::vector<std::string> dep_target_objects;
-        std::vector<std::string> dep_target_libs;
         std::vector<std::string> header_deps;
         bool parent_rebuild = false;
 
@@ -237,10 +236,6 @@ class Unit
 
         for (const auto& dep : deps)
         {
-            // if (dep->target_type == TargetType::DYNAMIC_LIB || dep->target_type == TargetType::STATIC_LIB)
-            // {
-            //     dep_target_libs.push_back(*dep->target_path);
-            // }
             if (dep->target_path)
             {
                 dep_target_objects.push_back(*dep->target_path);
