@@ -8,7 +8,6 @@
 #include <ranges>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -16,7 +15,9 @@ enum class TargetType
 {
     EXECUTABLE,
     STATIC_LIB,
-    DYNAMIC_LIB
+    DYNAMIC_LIB,
+    OBJECT,
+    NONE
 };
 
 inline void rebuild_self(const std::string& source_filename, int argc, char** argv,
@@ -116,6 +117,7 @@ class CompileCommands
   public:
     void add_cmd(size_t depth, const CompileCommand& compile_command)
     {
+        // fill to the insertion depth (all depth - 1 should already be populated)
         while (commands.size() <= depth)
         {
             commands.emplace_back();
@@ -148,10 +150,9 @@ class CompileCommands
             {
                 if (cmd.is_enabled())
                 {
-                    jobs.push_back(std::async(std::launch::async, [cmd]() {
-                        std::cout << "Running: " << cmd << "\n";
-                        return cmd.execute();
-                    }));
+                    std::cout << "Running: " << cmd << "\n";
+
+                    jobs.push_back(std::async(std::launch::async, [cmd]() { return cmd.execute(); }));
                 }
             }
             for (auto& job : jobs)
@@ -172,6 +173,9 @@ class Unit
     std::vector<std::unique_ptr<Unit>> deps;
     std::optional<std::string> source_path;
     std::optional<std::string> target_path;
+    std::vector<std::string> compile_flags;
+    std::vector<std::string> link_flags;
+    TargetType target_type;
 
     void print_depth_impl(int depth) const
     {
@@ -186,6 +190,20 @@ class Unit
         {
             std::cout << "  ";
         }
+
+        if (source_path && target_path)
+        {
+            std::cout << "Compilation unit: ";
+        }
+        if (source_path && !target_path)
+        {
+            std::cout << "Header dep: ";
+        }
+        if (!source_path && target_path)
+        {
+            std::cout << "Target: ";
+        }
+
         if (source_path)
         {
             std::cout << *source_path;
@@ -197,24 +215,42 @@ class Unit
         std::cout << std::endl;
     }
 
-    bool compile_impl(CompileCommands& compile_commands, int depth, const TargetType target_type,
-                      const bool full_rebuild) const
+    bool compile_impl(CompileCommands& compile_commands, int depth, TargetType target_type_parent,
+                      const bool full_rebuild, const std::vector<std::string>& inherited_compile_flags) const
     {
+        std::vector<std::string> local_compile_flags;
+        local_compile_flags.insert(local_compile_flags.begin(), inherited_compile_flags.begin(),
+                                   inherited_compile_flags.end());
+
+        local_compile_flags.insert(local_compile_flags.end(), compile_flags.begin(), compile_flags.end());
         // Recurse into dependencies
-        std::vector<std::string> dep_targets;
+        std::vector<std::string> dep_target_objects;
+        std::vector<std::string> dep_target_libs;
         std::vector<std::string> header_deps;
         bool parent_rebuild = false;
+
+        if (target_type == TargetType::EXECUTABLE || target_type == TargetType::DYNAMIC_LIB ||
+            target_type == TargetType::STATIC_LIB)
+        {
+            target_type_parent = target_type;
+        }
+
         for (const auto& dep : deps)
         {
+            // if (dep->target_type == TargetType::DYNAMIC_LIB || dep->target_type == TargetType::STATIC_LIB)
+            // {
+            //     dep_target_libs.push_back(*dep->target_path);
+            // }
             if (dep->target_path)
             {
-                dep_targets.push_back(*dep->target_path);
+                dep_target_objects.push_back(*dep->target_path);
             }
             else if (dep->source_path)
             {
                 header_deps.push_back(*dep->source_path);
             }
-            bool rebuild = dep->compile_impl(compile_commands, depth + 1, target_type, full_rebuild);
+            bool rebuild =
+                dep->compile_impl(compile_commands, depth + 1, target_type_parent, full_rebuild, local_compile_flags);
             parent_rebuild |= rebuild;
         }
 
@@ -241,11 +277,14 @@ class Unit
 
                 std::vector<std::string> args;
 
-                if (target_type == TargetType::DYNAMIC_LIB)
+                if (target_type_parent == TargetType::DYNAMIC_LIB)
                 {
                     args.push_back("-fPIC");
                 }
-                args.insert(args.end(), {"-MMD", "-c", "-std=c++23", "-O3", "-o", *target_path, *source_path});
+
+                args.insert(args.end(), local_compile_flags.begin(), local_compile_flags.end());
+
+                args.insert(args.end(), {"-MMD", "-c", "-o", *target_path, *source_path});
                 // .cpp -> .o compiling
                 compile_commands.add_cmd(depth, CompileCommand("c++", args, rebuild || full_rebuild));
             }
@@ -264,10 +303,15 @@ class Unit
                     compiler = "ar rcs";
                 }
 
+                if (target_type == TargetType::DYNAMIC_LIB || target_type == TargetType::EXECUTABLE)
+                {
+                    args.insert(args.end(), link_flags.begin(), link_flags.end());
+                }
+
                 args.push_back("-o");
                 args.push_back(*target_path);
 
-                for (const auto& target : dep_targets)
+                for (const auto& target : dep_target_objects)
                 {
                     args.push_back(target);
                     rebuild = rebuild ||
@@ -283,13 +327,39 @@ class Unit
 
   public:
     Unit(const std::optional<std::string>& source_path, const std::optional<std::string>& target_path = std::nullopt)
-        : source_path(source_path), target_path(target_path)
+        : source_path(source_path), target_path(target_path), target_type(TargetType::NONE)
     {
+        if (target_path)
+        {
+            std::string extension = std::filesystem::path(*target_path).extension();
+            if (extension == ".a")
+            {
+                target_type = TargetType::STATIC_LIB;
+            }
+            else if (extension == ".so")
+            {
+                target_type = TargetType::DYNAMIC_LIB;
+            }
+            else if (extension == ".o")
+            {
+                target_type = TargetType::OBJECT;
+            }
+        }
     }
 
     void add_dep(std::unique_ptr<Unit> unit)
     {
         deps.push_back(std::move(unit));
+    }
+
+    void add_link_flag(const std::string& flag)
+    {
+        link_flags.emplace_back(flag);
+    }
+
+    void add_compile_flag(const std::string& flag)
+    {
+        compile_flags.emplace_back(flag);
     }
 
     void print_depth()
@@ -300,17 +370,9 @@ class Unit
     CompileCommands compile(bool rebuild, int depth = 0)
     {
         CompileCommands compile_commands;
-        TargetType target_type = TargetType::EXECUTABLE;
-        std::string extension = std::filesystem::path(*target_path).extension();
-        if (extension == ".a")
-        {
-            target_type = TargetType::STATIC_LIB;
-        }
-        else if (extension == ".so")
-        {
-            target_type = TargetType::DYNAMIC_LIB;
-        }
-        compile_impl(compile_commands, depth, target_type, rebuild);
+        // TargetType target_type = TargetType::EXECUTABLE;
+
+        compile_impl(compile_commands, depth, target_type, rebuild, {});
 
         return compile_commands;
     }
