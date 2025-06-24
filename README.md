@@ -26,6 +26,9 @@
 - **Flexible build profiles**  
   Easily switch between different build configurations (e.g., debug, release, sanitizers) without duplicating configuration or directory structures.
 
+ - **Export compile database**  
+  Generate a `compile_commands.json` file for integration with tools like clangd and other language servers.
+
 ## Goals
 
 - Make building large, modular C++ projects straightforward and fast.

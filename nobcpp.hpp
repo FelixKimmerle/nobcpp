@@ -27,12 +27,14 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
     fs::path src = fs::canonical(source_filename);
     fs::path bin = fs::canonical(argv[0]);
 
-    bool needs_recompile = !fs::exists(bin) || fs::last_write_time(src) > fs::last_write_time(bin);
+    bool needs_recompile =
+        !fs::exists(bin) || fs::last_write_time(src) > fs::last_write_time(bin);
     if (!needs_recompile)
     {
         for (const auto& dep : deps)
         {
-            needs_recompile |= !fs::exists(dep) || fs::last_write_time(dep) > fs::last_write_time(bin);
+            needs_recompile |=
+                !fs::exists(dep) || fs::last_write_time(dep) > fs::last_write_time(bin);
         }
     }
 
@@ -41,7 +43,8 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
 
         std::cout << "Rebuilding: " << bin << "...\n";
         std::string temp_bin = bin.string() + ".new";
-        std::string cmd = "c++ -std=c++23 -Wall -Wextra -Wpedantic -O3 -o " + bin.string() + " " + src.string();
+        std::string cmd = "c++ -std=c++23 -Wall -Wextra -Wpedantic -O3 -o " +
+                          bin.string() + " " + src.string();
         int ret = std::system(cmd.c_str());
         if (ret != 0)
         {
@@ -66,6 +69,9 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
     std::cout << "nothing todo!" << std::endl;
 }
 
+// ----------------------------------------------------------------------------------
+// Type definitions
+// ----------------------------------------------------------------------------------
 class CompileCommand
 {
   private:
@@ -74,39 +80,12 @@ class CompileCommand
     bool enabled;
 
   public:
-    friend std::ostream& operator<<(std::ostream& os, const CompileCommand& cc)
-    {
-        os << cc.command << " ";
-        for (const auto& arg : cc.args)
-        {
-            os << arg << " ";
-        }
-        os << " enabled: " << cc.enabled;
-        return os;
-    }
-    CompileCommand(const std::string& command, const std::vector<std::string> args, bool enabled)
-        : command(command), args(args), enabled(enabled)
-    {
-    }
+    CompileCommand(const std::string& command, const std::vector<std::string> args,
+                   bool enabled);
+    bool is_enabled() const;
+    int execute() const;
 
-    bool is_enabled() const
-    {
-        return enabled;
-    }
-    int execute() const
-    {
-        if (!enabled)
-        {
-            return 0;
-        }
-        std::stringstream ss;
-        ss << command << " ";
-        for (const auto& arg : args)
-        {
-            ss << arg << " ";
-        }
-        return std::system(ss.str().c_str());
-    }
+    friend std::ostream& operator<<(std::ostream& os, const CompileCommand& cc);
 };
 
 class CompileCommands
@@ -115,57 +94,16 @@ class CompileCommands
     std::vector<std::vector<CompileCommand>> commands;
 
   public:
-    void add_cmd(size_t depth, const CompileCommand& compile_command)
-    {
-        // fill to the insertion depth (all depth - 1 should already be populated)
-        while (commands.size() <= depth)
-        {
-            commands.emplace_back();
-        }
-
-        commands[depth].push_back(compile_command);
-    }
-
-    friend std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands)
-    {
-        size_t level = 0;
-        for (const auto& cc : compile_commands.commands)
-        {
-            std::cout << "Level: " << level++ << std::endl;
-            for (const auto& c : cc)
-            {
-                std::cout << c << std::endl;
-            }
-        }
-
-        return os;
-    }
-
-    void execute() const
-    {
-        for (const auto& compile_level : std::views::reverse(commands))
-        {
-            std::vector<std::future<int>> jobs;
-            for (const auto& cmd : compile_level)
-            {
-                if (cmd.is_enabled())
-                {
-                    std::cout << "Running: " << cmd << "\n";
-
-                    jobs.push_back(std::async(std::launch::async, [cmd]() { return cmd.execute(); }));
-                }
-            }
-            for (auto& job : jobs)
-            {
-                if (job.get() != 0)
-                {
-                    std::cerr << "Command failed.\n";
-                    std::exit(1);
-                }
-            }
-        }
-    }
+    void add_cmd(size_t depth, const CompileCommand& compile_command);
+    void execute() const;
+    friend std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands);
 };
+
+inline CompileCommand::CompileCommand(const std::string& command,
+                                      const std::vector<std::string> args, bool enabled)
+    : command(command), args(args), enabled(enabled)
+{
+}
 
 class Unit
 {
@@ -177,202 +115,317 @@ class Unit
     std::vector<std::string> link_flags;
     TargetType target_type;
 
-    void print_depth_impl(int depth) const
-    {
-        // Recurse into dependencies
-        for (const auto& dep : deps)
-        {
-            dep->print_depth_impl(depth + 1);
-        }
+    void print_depth_impl(int depth) const;
 
-        // Indent based on depth
-        for (int i = 0; i < depth; ++i)
-        {
-            std::cout << "  ";
-        }
-
-        if (source_path && target_path)
-        {
-            std::cout << "Compilation unit: ";
-        }
-        if (source_path && !target_path)
-        {
-            std::cout << "Header dep: ";
-        }
-        if (!source_path && target_path)
-        {
-            std::cout << "Target: ";
-        }
-
-        if (source_path)
-        {
-            std::cout << *source_path;
-        }
-        if (target_path)
-        {
-            std::cout << " -> " << *target_path;
-        }
-        std::cout << std::endl;
-    }
-
-    bool compile_impl(CompileCommands& compile_commands, int depth, TargetType target_type_parent,
-                      const bool full_rebuild, const std::vector<std::string>& inherited_compile_flags) const
-    {
-        std::vector<std::string> local_compile_flags;
-        local_compile_flags.insert(local_compile_flags.begin(), inherited_compile_flags.begin(),
-                                   inherited_compile_flags.end());
-
-        local_compile_flags.insert(local_compile_flags.end(), compile_flags.begin(), compile_flags.end());
-        // Recurse into dependencies
-        std::vector<std::string> dep_target_objects;
-        std::vector<std::string> header_deps;
-        bool parent_rebuild = false;
-
-        if (target_type == TargetType::EXECUTABLE || target_type == TargetType::DYNAMIC_LIB ||
-            target_type == TargetType::STATIC_LIB)
-        {
-            target_type_parent = target_type;
-        }
-
-        for (const auto& dep : deps)
-        {
-            if (dep->target_path)
-            {
-                dep_target_objects.push_back(*dep->target_path);
-            }
-            else if (dep->source_path)
-            {
-                header_deps.push_back(*dep->source_path);
-            }
-            bool rebuild =
-                dep->compile_impl(compile_commands, depth + 1, target_type_parent, full_rebuild, local_compile_flags);
-            parent_rebuild |= rebuild;
-        }
-
-        if (target_path)
-        {
-            std::filesystem::create_directories(std::filesystem::path(*target_path).parent_path());
-            bool rebuild = parent_rebuild || !std::filesystem::exists(*target_path);
-            if (!header_deps.empty())
-            {
-
-                std::cout << *target_path << " has dependency on headers: ";
-                for (const auto& header_dep : header_deps)
-                {
-                    std::cout << header_dep << ", ";
-                    rebuild = rebuild || std::filesystem::last_write_time(header_dep) >
-                                             std::filesystem::last_write_time(*target_path);
-                }
-                std::cout << std::endl;
-            }
-            if (source_path)
-            {
-                rebuild = rebuild || std::filesystem::last_write_time(*source_path) >
-                                         std::filesystem::last_write_time(*target_path);
-
-                std::vector<std::string> args;
-
-                if (target_type_parent == TargetType::DYNAMIC_LIB)
-                {
-                    args.push_back("-fPIC");
-                }
-
-                args.insert(args.end(), local_compile_flags.begin(), local_compile_flags.end());
-
-                args.insert(args.end(), {"-MMD", "-c", "-o", *target_path, *source_path});
-                // .cpp -> .o compiling
-                compile_commands.add_cmd(depth, CompileCommand("c++", args, rebuild || full_rebuild));
-            }
-            else
-            {
-                // .o -> .exe linking
-                std::vector<std::string> args;
-
-                std::string compiler = "c++";
-                if (target_type == TargetType::DYNAMIC_LIB)
-                {
-                    args.push_back("-shared");
-                }
-                else if (target_type == TargetType::STATIC_LIB)
-                {
-                    compiler = "ar rcs";
-                }
-
-                if (target_type == TargetType::DYNAMIC_LIB || target_type == TargetType::EXECUTABLE)
-                {
-                    args.insert(args.end(), link_flags.begin(), link_flags.end());
-                }
-
-                args.push_back("-o");
-                args.push_back(*target_path);
-
-                for (const auto& target : dep_target_objects)
-                {
-                    args.push_back(target);
-                    rebuild = rebuild ||
-                              std::filesystem::last_write_time(target) > std::filesystem::last_write_time(*target_path);
-                }
-
-                compile_commands.add_cmd(depth, CompileCommand(compiler, args, rebuild || full_rebuild));
-            }
-            return rebuild;
-        }
-        return false;
-    }
+    bool compile_impl(CompileCommands& compile_commands, int depth,
+                      TargetType target_type_parent, const bool full_rebuild,
+                      const std::vector<std::string>& inherited_compile_flags) const;
 
   public:
-    Unit(const std::optional<std::string>& source_path, const std::optional<std::string>& target_path = std::nullopt)
-        : source_path(source_path), target_path(target_path), target_type(TargetType::NONE)
+    Unit(const std::optional<std::string>& source_path,
+         const std::optional<std::string>& target_path = std::nullopt);
+
+    void add_dep(std::unique_ptr<Unit> unit);
+    void add_link_flag(const std::string& flag);
+    void add_compile_flag(const std::string& flag);
+    void print_depth();
+    CompileCommands compile(bool rebuild, int depth = 0);
+};
+
+// ----------------------------------------------------------------------------------
+// CompileCommand
+// ----------------------------------------------------------------------------------
+
+inline bool CompileCommand::is_enabled() const
+{
+    return enabled;
+}
+inline int CompileCommand::execute() const
+{
+    if (!enabled)
     {
-        if (target_path)
+        return 0;
+    }
+    std::stringstream ss;
+    ss << command << " ";
+    for (const auto& arg : args)
+    {
+        ss << arg << " ";
+    }
+    return std::system(ss.str().c_str());
+}
+
+inline std::ostream& operator<<(std::ostream& os, const CompileCommand& cc)
+{
+    os << cc.command << " ";
+    for (const auto& arg : cc.args)
+    {
+        os << arg << " ";
+    }
+    os << " enabled: " << cc.enabled;
+    return os;
+}
+
+// ----------------------------------------------------------------------------------
+// CompileCommands
+// ----------------------------------------------------------------------------------
+
+inline void CompileCommands::add_cmd(size_t depth, const CompileCommand& compile_command)
+{
+    // fill to the insertion depth (all depth - 1 should already be populated)
+    while (commands.size() <= depth)
+    {
+        commands.emplace_back();
+    }
+
+    commands[depth].push_back(compile_command);
+}
+
+inline void CompileCommands::execute() const
+{
+    for (const auto& compile_level : std::views::reverse(commands))
+    {
+        std::vector<std::future<int>> jobs;
+        for (const auto& cmd : compile_level)
         {
-            std::string extension = std::filesystem::path(*target_path).extension();
-            if (extension == ".a")
+            if (cmd.is_enabled())
             {
-                target_type = TargetType::STATIC_LIB;
+                std::cout << "Running: " << cmd << "\n";
+
+                jobs.push_back(
+                    std::async(std::launch::async, [cmd]() { return cmd.execute(); }));
             }
-            else if (extension == ".so")
+        }
+        for (auto& job : jobs)
+        {
+            if (job.get() != 0)
             {
-                target_type = TargetType::DYNAMIC_LIB;
-            }
-            else if (extension == ".o")
-            {
-                target_type = TargetType::OBJECT;
+                std::cerr << "Command failed.\n";
+                std::exit(1);
             }
         }
     }
+}
 
-    void add_dep(std::unique_ptr<Unit> unit)
+inline std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands)
+{
+    size_t level = 0;
+    for (const auto& cc : compile_commands.commands)
     {
-        deps.push_back(std::move(unit));
+        std::cout << "Level: " << level++ << std::endl;
+        for (const auto& c : cc)
+        {
+            std::cout << c << std::endl;
+        }
     }
 
-    void add_link_flag(const std::string& flag)
+    return os;
+}
+
+// ----------------------------------------------------------------------------------
+// Unit
+// ----------------------------------------------------------------------------------
+
+inline void Unit::print_depth_impl(int depth) const
+{
+    // Recurse into dependencies
+    for (const auto& dep : deps)
     {
-        link_flags.emplace_back(flag);
+        dep->print_depth_impl(depth + 1);
     }
 
-    void add_compile_flag(const std::string& flag)
+    // Indent based on depth
+    for (int i = 0; i < depth; ++i)
     {
-        compile_flags.emplace_back(flag);
+        std::cout << "  ";
     }
 
-    void print_depth()
+    if (source_path && target_path)
     {
-        print_depth_impl(0);
+        std::cout << "Compilation unit: ";
+    }
+    if (source_path && !target_path)
+    {
+        std::cout << "Header dep: ";
+    }
+    if (!source_path && target_path)
+    {
+        std::cout << "Target: ";
     }
 
-    CompileCommands compile(bool rebuild, int depth = 0)
+    if (source_path)
     {
-        CompileCommands compile_commands;
-        // TargetType target_type = TargetType::EXECUTABLE;
-
-        compile_impl(compile_commands, depth, target_type, rebuild, {});
-
-        return compile_commands;
+        std::cout << *source_path;
     }
-};
+    if (target_path)
+    {
+        std::cout << " -> " << *target_path;
+    }
+    std::cout << std::endl;
+}
 
+inline bool Unit::compile_impl(
+    CompileCommands& compile_commands, int depth, TargetType target_type_parent,
+    const bool full_rebuild,
+    const std::vector<std::string>& inherited_compile_flags) const
+{
+    std::vector<std::string> local_compile_flags;
+    local_compile_flags.insert(local_compile_flags.begin(),
+                               inherited_compile_flags.begin(),
+                               inherited_compile_flags.end());
+
+    local_compile_flags.insert(local_compile_flags.end(), compile_flags.begin(),
+                               compile_flags.end());
+    // Recurse into dependencies
+    std::vector<std::string> dep_target_objects;
+    std::vector<std::string> header_deps;
+    bool parent_rebuild = false;
+
+    if (target_type == TargetType::EXECUTABLE || target_type == TargetType::DYNAMIC_LIB ||
+        target_type == TargetType::STATIC_LIB)
+    {
+        target_type_parent = target_type;
+    }
+
+    for (const auto& dep : deps)
+    {
+        if (dep->target_path)
+        {
+            dep_target_objects.push_back(*dep->target_path);
+        }
+        else if (dep->source_path)
+        {
+            header_deps.push_back(*dep->source_path);
+        }
+        bool rebuild = dep->compile_impl(compile_commands, depth + 1, target_type_parent,
+                                         full_rebuild, local_compile_flags);
+        parent_rebuild |= rebuild;
+    }
+
+    if (target_path)
+    {
+        std::filesystem::create_directories(
+            std::filesystem::path(*target_path).parent_path());
+        bool rebuild = parent_rebuild || !std::filesystem::exists(*target_path);
+        if (!header_deps.empty())
+        {
+
+            std::cout << *target_path << " has dependency on headers: ";
+            for (const auto& header_dep : header_deps)
+            {
+                std::cout << header_dep << ", ";
+                rebuild = rebuild || std::filesystem::last_write_time(header_dep) >
+                                         std::filesystem::last_write_time(*target_path);
+            }
+            std::cout << std::endl;
+        }
+        if (source_path)
+        {
+            rebuild = rebuild || std::filesystem::last_write_time(*source_path) >
+                                     std::filesystem::last_write_time(*target_path);
+
+            std::vector<std::string> args;
+
+            if (target_type_parent == TargetType::DYNAMIC_LIB)
+            {
+                args.push_back("-fPIC");
+            }
+
+            args.insert(args.end(), local_compile_flags.begin(),
+                        local_compile_flags.end());
+
+            args.insert(args.end(), {"-MMD", "-c", "-o", *target_path, *source_path});
+            // .cpp -> .o compiling
+            compile_commands.add_cmd(
+                depth, CompileCommand("c++", args, rebuild || full_rebuild));
+        }
+        else
+        {
+            // .o -> .exe linking
+            std::vector<std::string> args;
+
+            std::string compiler = "c++";
+            if (target_type == TargetType::DYNAMIC_LIB)
+            {
+                args.push_back("-shared");
+            }
+            else if (target_type == TargetType::STATIC_LIB)
+            {
+                compiler = "ar rcs";
+            }
+
+            if (target_type == TargetType::DYNAMIC_LIB ||
+                target_type == TargetType::EXECUTABLE)
+            {
+                args.insert(args.end(), link_flags.begin(), link_flags.end());
+            }
+
+            args.push_back("-o");
+            args.push_back(*target_path);
+
+            for (const auto& target : dep_target_objects)
+            {
+                args.push_back(target);
+                rebuild = rebuild || std::filesystem::last_write_time(target) >
+                                         std::filesystem::last_write_time(*target_path);
+            }
+
+            compile_commands.add_cmd(
+                depth, CompileCommand(compiler, args, rebuild || full_rebuild));
+        }
+        return rebuild;
+    }
+    return false;
+}
+
+inline Unit::Unit(const std::optional<std::string>& source_path,
+                  const std::optional<std::string>& target_path)
+    : source_path(source_path), target_path(target_path), target_type(TargetType::NONE)
+{
+    if (target_path)
+    {
+        std::string extension = std::filesystem::path(*target_path).extension();
+        if (extension == ".a")
+        {
+            target_type = TargetType::STATIC_LIB;
+        }
+        else if (extension == ".so")
+        {
+            target_type = TargetType::DYNAMIC_LIB;
+        }
+        else if (extension == ".o")
+        {
+            target_type = TargetType::OBJECT;
+        }
+    }
+}
+
+inline void Unit::add_dep(std::unique_ptr<Unit> unit)
+{
+    deps.push_back(std::move(unit));
+}
+
+inline void Unit::add_link_flag(const std::string& flag)
+{
+    link_flags.emplace_back(flag);
+}
+
+inline void Unit::add_compile_flag(const std::string& flag)
+{
+    compile_flags.emplace_back(flag);
+}
+
+inline void Unit::print_depth()
+{
+    print_depth_impl(0);
+}
+
+inline CompileCommands Unit::compile(bool rebuild, int depth)
+{
+    CompileCommands compile_commands;
+    compile_impl(compile_commands, depth, target_type, rebuild, {});
+    return compile_commands;
+}
 inline std::filesystem::path to_object_path(const std::filesystem::path& source)
 {
     std::filesystem::path relative = source.lexically_relative("src");
@@ -381,7 +434,12 @@ inline std::filesystem::path to_object_path(const std::filesystem::path& source)
     return obj_path;
 }
 
-inline std::vector<std::string> parse_dependency_file(const std::filesystem::path& d_file_path)
+// ----------------------------------------------------------------------------------
+// Utils
+// ----------------------------------------------------------------------------------
+
+inline std::vector<std::string> parse_dependency_file(
+    const std::filesystem::path& d_file_path)
 {
     std::ifstream file(d_file_path);
     if (!file)
@@ -445,8 +503,8 @@ inline std::vector<std::string> parse_dependency_file(const std::filesystem::pat
     return headers;
 }
 
-inline std::unique_ptr<Unit> build_tree_from_cpp_files(const std::filesystem::path& root_dir,
-                                                       const std::filesystem::path& target)
+inline std::unique_ptr<Unit> build_tree_from_cpp_files(
+    const std::filesystem::path& root_dir, const std::filesystem::path& target)
 {
     auto root = std::make_unique<Unit>(std::nullopt, target.string());
 
