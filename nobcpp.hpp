@@ -267,7 +267,7 @@ class Unit
                 args.push_back("-o");
                 args.push_back(*target_path);
 
-                for (const auto target : dep_targets)
+                for (const auto& target : dep_targets)
                 {
                     args.push_back(target);
                     rebuild = rebuild ||
