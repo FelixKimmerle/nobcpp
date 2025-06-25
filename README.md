@@ -5,10 +5,11 @@
 > Expect bugs, missing features, and breaking changes.  
 > **Do not use in production or for critical projects (yet)!**
 
-**nobcpp** is a C++-only build tool loosely inspired by [nob](https://github.com/tsoiding/nob), designed to simplify and accelerate the build process for large, modular C++ projects.
+**nobcpp** is a C++-only build tool loosely inspired by [nob](https://github.com/tsoding/nob.h), designed to simplify and accelerate the build process for large, modular C++ projects.
 
-- **Self-contained:** Can be bootstrapped with only a C++23 compiler—no external dependencies required.
+- **Self-contained:** Can be bootstrapped with only a C++20 compiler—no external dependencies required.
 - **Self-rebuilding:** Automatically rebuilds itself if the build process definition changes.
+- **Currently linux only, other OS may be supported later**
 
 ## Features
 

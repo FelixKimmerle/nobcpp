@@ -1,4 +1,6 @@
 #pragma once
+#include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -8,17 +10,129 @@
 #include <ranges>
 #include <sstream>
 #include <string>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
-enum class TargetType
+// ----------------------------------------------------------------------------------
+// Rebuild
+// ----------------------------------------------------------------------------------
+
+struct ProcessResult
 {
-    EXECUTABLE,
-    STATIC_LIB,
-    DYNAMIC_LIB,
-    OBJECT,
-    NONE
+    std::string out;
+    std::string err;
+    int exit_code;
 };
+
+inline ProcessResult run_process(const std::string& cmd,
+                                 const std::vector<std::string>& args)
+{
+    int out_pipe[2], err_pipe[2];
+    if (pipe(out_pipe) == -1 || pipe(err_pipe) == -1)
+    {
+        perror("pipe");
+        return {"", "", -1};
+    }
+
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        perror("fork");
+        return {"", "", -1};
+    }
+
+    if (pid == 0)
+    {
+        // Child
+        close(out_pipe[0]);
+        close(err_pipe[0]);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(err_pipe[1], STDERR_FILENO);
+        close(out_pipe[1]);
+        close(err_pipe[1]);
+        const std::string placeholder = "-fdiagnostics-color=always";
+
+        // Build argv
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(cmd.c_str()));
+        for (const auto& arg : args)
+            argv.push_back(const_cast<char*>(arg.c_str()));
+
+        if (cmd == "gcc" || cmd == "g++" || cmd == "c++" || cmd == "clang" ||
+            cmd == "clang++")
+        {
+            argv.push_back(const_cast<char*>(placeholder.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        // Pass through PATH from parent
+        const char* path = std::getenv("PATH");
+        std::string path_var = path ? std::string("PATH=") + path : "PATH=/usr/bin:/bin";
+        char* envp[] = {const_cast<char*>(path_var.c_str()), nullptr};
+
+        // Use execvpe to search PATH
+        execvpe(cmd.c_str(), argv.data(), envp);
+
+        // If execvpe fails
+        perror("execvpe");
+        _exit(127);
+    }
+    else
+    {
+        // Parent
+        close(out_pipe[1]);
+        close(err_pipe[1]);
+        std::string out, err;
+        char buffer[4096];
+        ssize_t count;
+        fd_set fds;
+        int maxfd = std::max(out_pipe[0], err_pipe[0]);
+        bool out_open = true, err_open = true;
+
+        while (out_open || err_open)
+        {
+            FD_ZERO(&fds);
+            if (out_open)
+                FD_SET(out_pipe[0], &fds);
+            if (err_open)
+                FD_SET(err_pipe[0], &fds);
+
+            int ready = select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
+            if (ready == -1)
+            {
+                perror("select");
+                break;
+            }
+
+            if (out_open && FD_ISSET(out_pipe[0], &fds))
+            {
+                count = read(out_pipe[0], buffer, sizeof(buffer));
+                if (count > 0)
+                    out.append(buffer, count);
+                else
+                    out_open = false;
+            }
+
+            if (err_open && FD_ISSET(err_pipe[0], &fds))
+            {
+                count = read(err_pipe[0], buffer, sizeof(buffer));
+                if (count > 0)
+                    err.append(buffer, count);
+                else
+                    err_open = false;
+            }
+        }
+
+        close(out_pipe[0]);
+        close(err_pipe[0]);
+        int status;
+        waitpid(pid, &status, 0);
+        int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        return {out, err, exit_code};
+    }
+}
 
 inline void rebuild_self(const std::string& source_filename, int argc, char** argv,
                          const std::vector<std::string>& deps = {})
@@ -40,10 +154,9 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
 
     if (needs_recompile)
     {
-
         std::cout << "Rebuilding: " << bin << "...\n";
         std::string temp_bin = bin.string() + ".new";
-        std::string cmd = "c++ -std=c++23 -Wall -Wextra -Wpedantic -O3 -o " +
+        std::string cmd = "c++ -std=c++20 -Wall -Wextra -Wpedantic -O3 -o " +
                           bin.string() + " " + src.string();
         int ret = std::system(cmd.c_str());
         if (ret != 0)
@@ -72,6 +185,16 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
 // ----------------------------------------------------------------------------------
 // Type definitions
 // ----------------------------------------------------------------------------------
+
+enum class TargetType
+{
+    EXECUTABLE,
+    STATIC_LIB,
+    DYNAMIC_LIB,
+    OBJECT,
+    NONE
+};
+
 class CompileCommand
 {
   private:
@@ -127,7 +250,9 @@ class Unit
 
     void add_dep(std::unique_ptr<Unit> unit);
     void add_link_flag(const std::string& flag);
+    void add_link_flags(const std::vector<std::string>& flags);
     void add_compile_flag(const std::string& flag);
+    void add_compile_flags(const std::vector<std::string>& flags);
     void print_depth();
     CompileCommands compile(bool rebuild, int depth = 0);
 };
@@ -140,19 +265,27 @@ inline bool CompileCommand::is_enabled() const
 {
     return enabled;
 }
+
 inline int CompileCommand::execute() const
 {
     if (!enabled)
     {
         return 0;
     }
-    std::stringstream ss;
-    ss << command << " ";
-    for (const auto& arg : args)
+    auto [output, error_output, exit_code] = run_process(command, args);
+    if (exit_code != 0)
     {
-        ss << arg << " ";
+        std::cout << "Exit code: " << exit_code << "\n";
     }
-    return std::system(ss.str().c_str());
+    if (output.size() > 0)
+    {
+        std::cout << "stdout: \n" << output << std::endl;
+    }
+    if (error_output.size() > 0)
+    {
+        std::cout << "stderr: \n" << error_output << std::endl;
+    }
+    return exit_code;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const CompileCommand& cc)
@@ -337,21 +470,22 @@ inline bool Unit::compile_impl(
             args.insert(args.end(), {"-MMD", "-c", "-o", *target_path, *source_path});
             // .cpp -> .o compiling
             compile_commands.add_cmd(
-                depth, CompileCommand("c++", args, rebuild || full_rebuild));
+                depth, CompileCommand("clang++", args, rebuild || full_rebuild));
         }
         else
         {
             // .o -> .exe linking
             std::vector<std::string> args;
 
-            std::string compiler = "c++";
+            std::string compiler = "clang++";
             if (target_type == TargetType::DYNAMIC_LIB)
             {
                 args.push_back("-shared");
             }
             else if (target_type == TargetType::STATIC_LIB)
             {
-                compiler = "ar rcs";
+                compiler = "ar";
+                args.push_back("rcs");
             }
 
             if (target_type == TargetType::DYNAMIC_LIB ||
@@ -410,9 +544,19 @@ inline void Unit::add_link_flag(const std::string& flag)
     link_flags.emplace_back(flag);
 }
 
+inline void Unit::add_link_flags(const std::vector<std::string>& flags)
+{
+    link_flags.insert(link_flags.begin(), flags.begin(), flags.end());
+}
+
 inline void Unit::add_compile_flag(const std::string& flag)
 {
     compile_flags.emplace_back(flag);
+}
+
+inline void Unit::add_compile_flags(const std::vector<std::string>& flags)
+{
+    compile_flags.insert(compile_flags.begin(), flags.begin(), flags.end());
 }
 
 inline void Unit::print_depth()
@@ -426,6 +570,11 @@ inline CompileCommands Unit::compile(bool rebuild, int depth)
     compile_impl(compile_commands, depth, target_type, rebuild, {});
     return compile_commands;
 }
+
+// ----------------------------------------------------------------------------------
+// Utils
+// ----------------------------------------------------------------------------------
+
 inline std::filesystem::path to_object_path(const std::filesystem::path& source)
 {
     std::filesystem::path relative = source.lexically_relative("src");
@@ -433,10 +582,6 @@ inline std::filesystem::path to_object_path(const std::filesystem::path& source)
     obj_path.replace_extension(".o");
     return obj_path;
 }
-
-// ----------------------------------------------------------------------------------
-// Utils
-// ----------------------------------------------------------------------------------
 
 inline std::vector<std::string> parse_dependency_file(
     const std::filesystem::path& d_file_path)
