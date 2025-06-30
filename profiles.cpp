@@ -7,8 +7,7 @@
 using FlagList = std::vector<std::string>;
 using ProfileDimension = std::map<std::string, FlagList>;
 
-FlagList get_flags(
-    const std::vector<std::pair<const ProfileDimension&, std::string>>& selections)
+FlagList get_flags(const std::vector<std::pair<const ProfileDimension&, std::string>>& selections)
 {
     FlagList result;
     for (const auto& [dimension, key] : selections)
