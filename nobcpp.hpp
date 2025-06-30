@@ -16,6 +16,10 @@
 #include <vector>
 
 // ----------------------------------------------------------------------------------
+// Utils
+// ----------------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------------
 // Rebuild
 // ----------------------------------------------------------------------------------
 
@@ -26,7 +30,8 @@ struct ProcessResult
     int exit_code;
 };
 
-inline ProcessResult run_process(const std::string& cmd, const std::vector<std::string>& args)
+inline ProcessResult run_process(const std::string& cmd,
+                                 const std::vector<std::string>& args)
 {
     int out_pipe[2], err_pipe[2];
     if (pipe(out_pipe) == -1 || pipe(err_pipe) == -1)
@@ -59,7 +64,8 @@ inline ProcessResult run_process(const std::string& cmd, const std::vector<std::
         for (const auto& arg : args)
             argv.push_back(const_cast<char*>(arg.c_str()));
 
-        if (cmd == "gcc" || cmd == "g++" || cmd == "c++" || cmd == "clang" || cmd == "clang++")
+        if (cmd == "gcc" || cmd == "g++" || cmd == "c++" || cmd == "clang" ||
+            cmd == "clang++")
         {
             argv.push_back(const_cast<char*>(placeholder.c_str()));
         }
@@ -139,12 +145,14 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
     fs::path src = fs::canonical(source_filename);
     fs::path bin = fs::canonical(argv[0]);
 
-    bool needs_recompile = !fs::exists(bin) || fs::last_write_time(src) > fs::last_write_time(bin);
+    bool needs_recompile =
+        !fs::exists(bin) || fs::last_write_time(src) > fs::last_write_time(bin);
     if (!needs_recompile)
     {
         for (const auto& dep : deps)
         {
-            needs_recompile |= !fs::exists(dep) || fs::last_write_time(dep) > fs::last_write_time(bin);
+            needs_recompile |=
+                !fs::exists(dep) || fs::last_write_time(dep) > fs::last_write_time(bin);
         }
     }
 
@@ -152,7 +160,8 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
     {
         std::cout << "Rebuilding: " << bin << "...\n";
         std::string temp_bin = bin.string() + ".new";
-        std::string cmd = "c++ -std=c++20 -Wall -Wextra -Wpedantic -O3 -o " + bin.string() + " " + src.string();
+        std::string cmd = "c++ -std=c++20 -Wall -Wextra -Wpedantic -O3 -o " +
+                          bin.string() + " " + src.string();
         int ret = std::system(cmd.c_str());
         if (ret != 0)
         {
@@ -199,11 +208,12 @@ class CompileCommand
     bool compile;
 
   public:
-    CompileCommand(const std::string& command, const std::vector<std::string> args, bool enabled, bool compile);
+    CompileCommand(const std::string& command, const std::vector<std::string> args,
+                   bool enabled, bool compile);
     bool is_enabled() const;
     bool is_compile() const;
     int execute() const;
-    const std::string get_file() const;
+    const std::string get_abs_file() const;
 
     friend std::ostream& operator<<(std::ostream& os, const CompileCommand& cc);
 };
@@ -220,7 +230,8 @@ class CompileCommands
     friend std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands);
 };
 
-inline CompileCommand::CompileCommand(const std::string& command, const std::vector<std::string> args, bool enabled,
+inline CompileCommand::CompileCommand(const std::string& command,
+                                      const std::vector<std::string> args, bool enabled,
                                       bool compile)
     : command(command), args(args), enabled(enabled), compile(compile)
 {
@@ -238,11 +249,13 @@ class Unit
 
     void print_depth_impl(int depth) const;
 
-    bool compile_impl(CompileCommands& compile_commands, int depth, TargetType target_type_parent,
-                      const bool full_rebuild, const std::vector<std::string>& inherited_compile_flags) const;
+    bool compile_impl(CompileCommands& compile_commands, int depth,
+                      TargetType target_type_parent, const bool full_rebuild,
+                      const std::vector<std::string>& inherited_compile_flags) const;
 
   public:
-    Unit(const std::optional<std::string>& source_path, const std::optional<std::string>& target_path = std::nullopt);
+    Unit(const std::optional<std::string>& source_path,
+         const std::optional<std::string>& target_path = std::nullopt);
 
     void add_dep(std::unique_ptr<Unit> unit);
     void add_link_flag(const std::string& flag);
@@ -290,7 +303,7 @@ inline int CompileCommand::execute() const
     return exit_code;
 }
 
-inline const std::string CompileCommand::get_file() const
+inline const std::string CompileCommand::get_abs_file() const
 {
     std::filesystem::path rel_path(args.back());
     std::filesystem::path abs_path = std::filesystem::absolute(rel_path);
@@ -340,7 +353,8 @@ inline void CompileCommands::execute() const
             {
                 std::cout << "Running: " << cmd << "\n";
 
-                jobs.push_back(std::async(std::launch::async, [cmd]() { return cmd.execute(); }));
+                jobs.push_back(
+                    std::async(std::launch::async, [cmd]() { return cmd.execute(); }));
             }
         }
         for (auto& job : jobs)
@@ -356,37 +370,38 @@ inline void CompileCommands::execute() const
 
 inline void CompileCommands::write() const
 {
+    std::vector<CompileCommand> filtered_commands;
+    for (const auto& cc : commands)
+    {
+        for (const auto& c : cc)
+        {
+            if (c.is_compile())
+            {
+                filtered_commands.push_back(c);
+            }
+        }
+    }
+
     std::ofstream out_file("compile_commands.json");
     if (out_file)
     {
         out_file << "[\n";
-        size_t level = 0;
-        for (const auto& cc : commands)
+        for (size_t i = 0; i < filtered_commands.size(); i++)
         {
-            size_t cmd_count = 0;
-            for (const auto& c : cc)
+            out_file << "\t{\n";
+            // std::cout << c << std::endl;
+            out_file << "\t\t\"directory\": \".\",\n";
+            out_file << "\t\t\"command\": \"";
+            out_file << filtered_commands[i] << "\",\n";
+            out_file << "\t\t\"file\":";
+            out_file << "\"" << filtered_commands[i].get_abs_file() << "\"";
+            out_file << "\n\t}";
+            if (i + 1 != filtered_commands.size())
             {
-                if (c.is_compile())
-                {
-                    out_file << "{\n";
-                    // std::cout << c << std::endl;
-                    out_file << "\"directory\": \".\",\n";
-                    out_file << "\"command\": \"";
-                    out_file << c << "\",\n";
-                    out_file << "\"file\":";
-                    out_file << "\"" << c.get_file() << "\"";
-                    out_file << "\n}";
-                    if (level + 1 != commands.size() || cmd_count + 1 != cc.size())
-                    {
-                        out_file << ",";
-                    }
-                    out_file << "\n";
-                }
-                cmd_count++;
+                out_file << ",\n";
             }
-            level++;
         }
-        out_file << "\n]";
+        out_file << "\n]\n";
     }
 }
 
@@ -447,14 +462,18 @@ inline void Unit::print_depth_impl(int depth) const
     std::cout << std::endl;
 }
 
-inline bool Unit::compile_impl(CompileCommands& compile_commands, int depth, TargetType target_type_parent,
-                               const bool full_rebuild, const std::vector<std::string>& inherited_compile_flags) const
+inline bool Unit::compile_impl(
+    CompileCommands& compile_commands, int depth, TargetType target_type_parent,
+    const bool full_rebuild,
+    const std::vector<std::string>& inherited_compile_flags) const
 {
     std::vector<std::string> local_compile_flags;
-    local_compile_flags.insert(local_compile_flags.begin(), inherited_compile_flags.begin(),
+    local_compile_flags.insert(local_compile_flags.begin(),
+                               inherited_compile_flags.begin(),
                                inherited_compile_flags.end());
 
-    local_compile_flags.insert(local_compile_flags.end(), compile_flags.begin(), compile_flags.end());
+    local_compile_flags.insert(local_compile_flags.end(), compile_flags.begin(),
+                               compile_flags.end());
     // Recurse into dependencies
     std::vector<std::string> dep_target_objects;
     std::vector<std::string> header_deps;
@@ -476,14 +495,15 @@ inline bool Unit::compile_impl(CompileCommands& compile_commands, int depth, Tar
         {
             header_deps.push_back(*dep->source_path);
         }
-        bool rebuild =
-            dep->compile_impl(compile_commands, depth + 1, target_type_parent, full_rebuild, local_compile_flags);
+        bool rebuild = dep->compile_impl(compile_commands, depth + 1, target_type_parent,
+                                         full_rebuild, local_compile_flags);
         parent_rebuild |= rebuild;
     }
 
     if (target_path)
     {
-        std::filesystem::create_directories(std::filesystem::path(*target_path).parent_path());
+        std::filesystem::create_directories(
+            std::filesystem::path(*target_path).parent_path());
         bool rebuild = parent_rebuild || !std::filesystem::exists(*target_path);
         if (!header_deps.empty())
         {
@@ -491,15 +511,15 @@ inline bool Unit::compile_impl(CompileCommands& compile_commands, int depth, Tar
             for (const auto& header_dep : header_deps)
             {
                 std::cout << header_dep << ", ";
-                rebuild = rebuild ||
-                          std::filesystem::last_write_time(header_dep) > std::filesystem::last_write_time(*target_path);
+                rebuild = rebuild || std::filesystem::last_write_time(header_dep) >
+                                         std::filesystem::last_write_time(*target_path);
             }
             std::cout << std::endl;
         }
         if (source_path)
         {
-            rebuild = rebuild ||
-                      std::filesystem::last_write_time(*source_path) > std::filesystem::last_write_time(*target_path);
+            rebuild = rebuild || std::filesystem::last_write_time(*source_path) >
+                                     std::filesystem::last_write_time(*target_path);
 
             std::vector<std::string> args;
 
@@ -508,11 +528,13 @@ inline bool Unit::compile_impl(CompileCommands& compile_commands, int depth, Tar
                 args.push_back("-fPIC");
             }
 
-            args.insert(args.end(), local_compile_flags.begin(), local_compile_flags.end());
+            args.insert(args.end(), local_compile_flags.begin(),
+                        local_compile_flags.end());
 
             args.insert(args.end(), {"-MMD", "-c", "-o", *target_path, *source_path});
             // .cpp -> .o compiling
-            compile_commands.add_cmd(depth, CompileCommand("clang++", args, rebuild || full_rebuild, true));
+            compile_commands.add_cmd(
+                depth, CompileCommand("clang++", args, rebuild || full_rebuild, true));
         }
         else
         {
@@ -530,7 +552,8 @@ inline bool Unit::compile_impl(CompileCommands& compile_commands, int depth, Tar
                 args.push_back("rcs");
             }
 
-            if (target_type == TargetType::DYNAMIC_LIB || target_type == TargetType::EXECUTABLE)
+            if (target_type == TargetType::DYNAMIC_LIB ||
+                target_type == TargetType::EXECUTABLE)
             {
                 args.insert(args.end(), link_flags.begin(), link_flags.end());
             }
@@ -541,18 +564,20 @@ inline bool Unit::compile_impl(CompileCommands& compile_commands, int depth, Tar
             for (const auto& target : dep_target_objects)
             {
                 args.push_back(target);
-                rebuild = rebuild ||
-                          std::filesystem::last_write_time(target) > std::filesystem::last_write_time(*target_path);
+                rebuild = rebuild || std::filesystem::last_write_time(target) >
+                                         std::filesystem::last_write_time(*target_path);
             }
 
-            compile_commands.add_cmd(depth, CompileCommand(compiler, args, rebuild || full_rebuild, false));
+            compile_commands.add_cmd(
+                depth, CompileCommand(compiler, args, rebuild || full_rebuild, false));
         }
         return rebuild;
     }
     return false;
 }
 
-inline Unit::Unit(const std::optional<std::string>& source_path, const std::optional<std::string>& target_path)
+inline Unit::Unit(const std::optional<std::string>& source_path,
+                  const std::optional<std::string>& target_path)
     : source_path(source_path), target_path(target_path), target_type(TargetType::NONE)
 {
     if (target_path)
@@ -627,7 +652,8 @@ inline std::filesystem::path to_object_path(const std::filesystem::path& source)
     return obj_path;
 }
 
-inline std::vector<std::string> parse_dependency_file(const std::filesystem::path& d_file_path)
+inline std::vector<std::string> parse_dependency_file(
+    const std::filesystem::path& d_file_path)
 {
     std::ifstream file(d_file_path);
     if (!file)
@@ -691,8 +717,8 @@ inline std::vector<std::string> parse_dependency_file(const std::filesystem::pat
     return headers;
 }
 
-inline std::unique_ptr<Unit> build_tree_from_cpp_files(const std::filesystem::path& root_dir,
-                                                       const std::filesystem::path& target)
+inline std::unique_ptr<Unit> build_tree_from_cpp_files(
+    const std::filesystem::path& root_dir, const std::filesystem::path& target)
 {
     auto root = std::make_unique<Unit>(std::nullopt, target.string());
 
