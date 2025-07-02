@@ -102,6 +102,111 @@ inline std::ostream& operator<<(std::ostream& os, const Timer& timer)
     return os;
 }
 
+// Command line parser
+
+#include <filesystem>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+// Context for build actions
+struct BuildContext
+{
+    std::vector<std::string> flags;
+    std::string build_folder = "build";
+    std::string binary_name = "mybinary";
+    // Add more fields as needed
+};
+
+// Result of argument parsing
+struct ParsedArgs
+{
+    std::set<std::string> configs_used;       // Sorted, for deterministic order
+    std::vector<std::string> commands_to_run; // In order of appearance
+};
+
+// Type aliases for actions
+using ConfigAction = std::function<void(BuildContext&)>;
+using CommandAction = std::function<void(BuildContext&)>;
+
+// Parse command line arguments
+template <typename ConfigMap, typename CommandMap>
+inline ParsedArgs parse_args(int argc, char* argv[], const ConfigMap& configs, const CommandMap& commands)
+{
+    std::set<std::string> known_configs;
+    for (const auto& kv : configs)
+        known_configs.insert(kv.first);
+
+    std::set<std::string> known_commands;
+    for (const auto& kv : commands)
+        known_commands.insert(kv.first);
+
+    ParsedArgs result;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if (known_configs.count(arg))
+        {
+            result.configs_used.insert(arg);
+        }
+        else if (known_commands.count(arg))
+        {
+            result.commands_to_run.push_back(arg);
+        }
+        else
+        {
+            std::cout << "Unknown argument: " << arg << "\n";
+        }
+    }
+    return result;
+}
+
+// Compose build folder name from sorted configs
+inline std::string compose_build_folder(const std::set<std::string>& configs_used)
+{
+    std::string build_folder = "build";
+    if (!configs_used.empty())
+    {
+        build_folder += "/";
+        bool first = true;
+        for (const auto& cfg : configs_used)
+        {
+            if (!first)
+                build_folder += "-";
+            build_folder += cfg;
+            first = false;
+        }
+    }
+    else
+    {
+        build_folder += "/default";
+    }
+    return build_folder;
+}
+
+// Apply config actions in sorted order
+inline void apply_configs(const std::set<std::string>& configs_used, const std::map<std::string, ConfigAction>& configs,
+                          BuildContext& ctx)
+{
+    for (const auto& cfg : configs_used)
+    {
+        configs.at(cfg)(ctx);
+    }
+}
+
+// Execute commands in order
+inline void execute_commands(const std::vector<std::string>& commands_to_run,
+                             const std::map<std::string, CommandAction>& commands, BuildContext& ctx)
+{
+    for (const auto& cmd : commands_to_run)
+    {
+        commands.at(cmd)(ctx);
+    }
+}
+
 // ----------------------------------------------------------------------------------
 // Rebuild
 // ----------------------------------------------------------------------------------
