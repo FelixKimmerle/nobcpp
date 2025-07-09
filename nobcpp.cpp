@@ -31,7 +31,8 @@ int main(int argc, char** argv /*, char** envp*/)
 
     auto tree_2 = build_tree_from_cpp_files("src/project_2/", "build/project_2/target.a");
 
-    const auto tree_1 = build_tree_from_cpp_files("src/project_1/", "build/project_1/target");
+    const auto tree_1 =
+        build_tree_from_cpp_files("src/project_1/", "build/project_1/target");
 
     // tree_1->set_compiler("g++");
     // tree_2->set_compiler("clang++");
@@ -63,8 +64,8 @@ int main(int argc, char** argv /*, char** envp*/)
          [](BuildContext& c) {
              std::string binary = c.build_folder + "/" + c.binary_name;
              if (std::filesystem::exists(binary) &&
-                 (std::filesystem::status(binary).permissions() & std::filesystem::perms::owner_exec) !=
-                     std::filesystem::perms::none)
+                 (std::filesystem::status(binary).permissions() &
+                  std::filesystem::perms::owner_exec) != std::filesystem::perms::none)
              {
                  std::cout << "Running: " << binary << "\n";
                  std::system(binary.c_str());
