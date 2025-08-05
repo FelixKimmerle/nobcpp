@@ -11,10 +11,12 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -104,114 +106,6 @@ inline std::ostream& operator<<(std::ostream& os, const Timer& timer)
     return os;
 }
 
-// Command line parser
-
-#include <filesystem>
-#include <functional>
-#include <iostream>
-#include <map>
-#include <set>
-#include <string>
-#include <vector>
-
-// Context for build actions
-struct BuildContext
-{
-    std::vector<std::string> flags;
-    std::string build_folder = "build";
-    std::string binary_name = "mybinary";
-    // Add more fields as needed
-};
-
-// Result of argument parsing
-struct ParsedArgs
-{
-    std::set<std::string> configs_used;       // Sorted, for deterministic order
-    std::vector<std::string> commands_to_run; // In order of appearance
-};
-
-// Type aliases for actions
-using ConfigAction = std::function<void(BuildContext&)>;
-using CommandAction = std::function<void(BuildContext&)>;
-
-// Parse command line arguments
-template <typename ConfigMap, typename CommandMap>
-inline ParsedArgs parse_args(int argc, char* argv[], const ConfigMap& configs,
-                             const CommandMap& commands)
-{
-    std::set<std::string> known_configs;
-    for (const auto& kv : configs)
-        known_configs.insert(kv.first);
-
-    std::set<std::string> known_commands;
-    for (const auto& kv : commands)
-        known_commands.insert(kv.first);
-
-    ParsedArgs result;
-    for (int i = 1; i < argc; ++i)
-    {
-        std::string arg = argv[i];
-        if (known_configs.count(arg))
-        {
-            result.configs_used.insert(arg);
-        }
-        else if (known_commands.count(arg))
-        {
-            result.commands_to_run.push_back(arg);
-        }
-        else
-        {
-            std::cout << "Unknown argument: " << arg << "\n";
-        }
-    }
-    return result;
-}
-
-// Compose build folder name from sorted configs
-inline std::string compose_build_folder(const std::set<std::string>& configs_used)
-{
-    std::string build_folder = "build";
-    if (!configs_used.empty())
-    {
-        build_folder += "/";
-        bool first = true;
-        for (const auto& cfg : configs_used)
-        {
-            if (!first)
-                build_folder += "-";
-            build_folder += cfg;
-            first = false;
-        }
-    }
-    else
-    {
-        build_folder += "/default";
-    }
-    return build_folder;
-}
-
-// Apply config actions in sorted order
-inline void apply_configs(const std::set<std::string>& configs_used,
-                          const std::map<std::string, ConfigAction>& configs,
-                          BuildContext& ctx)
-{
-    for (const auto& cfg : configs_used)
-    {
-        configs.at(cfg)(ctx);
-    }
-}
-
-// Execute commands in order
-inline void execute_commands(const std::vector<std::string>& commands_to_run,
-                             const std::map<std::string, CommandAction>& commands,
-                             BuildContext& ctx)
-{
-    for (const auto& cmd : commands_to_run)
-    {
-        commands.at(cmd)(ctx);
-    }
-}
-
 // ----------------------------------------------------------------------------------
 // Rebuild
 // ----------------------------------------------------------------------------------
@@ -249,18 +143,20 @@ inline ProcessResult run_process(const std::string& cmd,
         dup2(err_pipe[1], STDERR_FILENO);
         close(out_pipe[1]);
         close(err_pipe[1]);
-        const std::string placeholder = "-fdiagnostics-color=always";
+        const std::string enable_color_flag = "-fdiagnostics-color=always";
 
         // Build argv
         std::vector<char*> argv;
         argv.push_back(const_cast<char*>(cmd.c_str()));
         for (const auto& arg : args)
+        {
             argv.push_back(const_cast<char*>(arg.c_str()));
+        }
 
         if (cmd == "gcc" || cmd == "g++" || cmd == "c++" || cmd == "clang" ||
             cmd == "clang++")
         {
-            argv.push_back(const_cast<char*>(placeholder.c_str()));
+            argv.push_back(const_cast<char*>(enable_color_flag.c_str()));
         }
         argv.push_back(nullptr);
 
@@ -430,6 +326,30 @@ inline CompileCommand::CompileCommand(const std::string& command,
 {
 }
 
+class Profile
+{
+  private:
+    std::vector<std::string> compile_flags;
+    std::vector<std::string> link_flags;
+
+  public:
+    Profile(const std::vector<std::string>& compile_flags = {},
+            const std::vector<std::string>& link_flags = {})
+        : compile_flags(compile_flags), link_flags(link_flags)
+    {
+    }
+
+    const std::vector<std::string>& get_compile_flags() const
+    {
+        return compile_flags;
+    }
+
+    const std::vector<std::string>& get_link_flags() const
+    {
+        return link_flags;
+    }
+};
+
 class Unit
 {
   private:
@@ -438,6 +358,7 @@ class Unit
     std::optional<std::string> target_path;
     std::vector<std::string> compile_flags;
     std::vector<std::string> link_flags;
+    std::set<std::string> active_profiles;
     TargetType target_type;
     std::string compiler;
 
@@ -446,6 +367,7 @@ class Unit
     bool compile_impl(CompileCommands& compile_commands, int depth,
                       TargetType target_type_parent, const bool full_rebuild,
                       const std::vector<std::string>& inherited_compile_flags) const;
+    void apply_profile(const std::string& name, const Profile& profile);
 
   public:
     Unit(const std::optional<std::string>& source_path,
@@ -458,9 +380,74 @@ class Unit
     void add_compile_flags(const std::vector<std::string>& flags);
     void print_depth();
     void set_compiler(const std::string& compiler);
-    CompileCommands compile(bool rebuild, int depth = 0);
+    CompileCommands compile(bool rebuild, int depth = 0) const;
+    std::string get_target() const;
+    void parse(int argc, char** argv,
+               const std::unordered_map<std::string, Profile>& profiles = {});
     friend std::ostream& operator<<(std::ostream& os, const Unit& unit);
 };
+
+// ----------------------------------------------------------------------------------
+// Parse command line args
+// ----------------------------------------------------------------------------------
+
+using CmdCommand = std::function<void(const Unit*)>;
+static std::unordered_map<std::string, CmdCommand> commands = {
+    {"build",
+     [](const Unit* unit) {
+         std::cout << "build" << std::endl;
+         CompileCommands cc = unit->compile(false);
+         cc.execute();
+         cc.write();
+     }},
+
+    {"clean", [](const Unit* unit) { std::cout << "clean" << std::endl; }},
+    {"run",
+     [](const Unit* unit) {
+         std::cout << "run" << std::endl;
+         // auto [output, error_output, exit_code] = run_process(unit->get_target(), {});
+         std::system(unit->get_target().c_str());
+     }},
+    {"rebuild", [](const Unit* unit) {
+         std::cout << "rebuild" << std::endl;
+         CompileCommands cc = unit->compile(true);
+         cc.execute();
+         cc.write();
+     }}};
+
+inline void Unit::parse(int argc, char** argv,
+                        const std::unordered_map<std::string, Profile>& profiles)
+{
+    std::vector<std::string> cmd_flags;
+    cmd_flags.reserve(argc - 1);
+
+    for (int i = 1; i < argc; i++)
+    {
+        cmd_flags.push_back(argv[i]);
+    }
+
+    if (cmd_flags.size() == 0)
+    {
+        std::cout << "No flags specified!" << std::endl;
+    }
+
+    for (const std::string& cmd_flag : cmd_flags)
+    {
+        if (commands.contains(cmd_flag))
+        {
+            commands[cmd_flag](this);
+        }
+        else if (profiles.contains(cmd_flag))
+        {
+            const Profile& profile = profiles.at(cmd_flag);
+            apply_profile(cmd_flag, profile);
+        }
+        else
+        {
+            std::cout << "Flag: " << cmd_flag << " unknown!" << std::endl;
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------------
 // CompileCommand
@@ -788,6 +775,13 @@ inline bool Unit::compile_impl(
     return false;
 }
 
+inline void Unit::apply_profile(const std::string& name, const Profile& profile)
+{
+    active_profiles.insert(name);
+    add_compile_flags(profile.get_compile_flags());
+    add_link_flags(profile.get_link_flags());
+}
+
 inline Unit::Unit(const std::optional<std::string>& source_path,
                   const std::optional<std::string>& target_path)
     : source_path(source_path), target_path(target_path), target_type(TargetType::NONE),
@@ -854,11 +848,16 @@ inline void Unit::set_compiler(const std::string& compiler)
     }
 }
 
-inline CompileCommands Unit::compile(bool rebuild, int depth)
+inline CompileCommands Unit::compile(bool rebuild, int depth) const
 {
     CompileCommands compile_commands;
     compile_impl(compile_commands, depth, target_type, rebuild, {});
     return compile_commands;
+}
+
+inline std::string Unit::get_target() const
+{
+    return *target_path;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Unit& unit)
