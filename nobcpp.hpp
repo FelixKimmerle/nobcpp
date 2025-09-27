@@ -261,7 +261,7 @@ inline void rebuild_self(const std::string& source_filename, int argc, char** ar
         std::rename(temp_bin.c_str(), bin.string().c_str());
         std::vector<char*> new_argv;
         new_argv.push_back(argv[0]);
-        std::string flag = "rebuild";
+        std::string flag = "nob_rebuild";
         new_argv.push_back(const_cast<char*>(flag.c_str()));
         for (int i = 1; i < argc; ++i)
         {
@@ -371,6 +371,7 @@ class Unit
     bool compile_impl(CompileCommands& compile_commands, TargetType target_type_parent,
                       const bool full_rebuild,
                       const std::vector<std::string>& inherited_compile_flags) const;
+    void clean_impl(CompileCommands& compile_commands) const;
     void apply_profile(const std::string& name, const Profile& profile);
 
   public:
@@ -385,6 +386,7 @@ class Unit
     void print_depth();
     void set_compiler(const std::string& compiler);
     CompileCommands compile(bool rebuild) const;
+    CompileCommands clean(bool remove_dir) const;
     std::string get_target() const;
     void parse(int argc, char** argv,
                const std::unordered_map<std::string, Profile>& profiles = {});
@@ -404,12 +406,24 @@ static std::unordered_map<std::string, CmdCommand> commands = {
          cc.execute();
          cc.write();
      }},
-
-    {"clean", [](const Unit* unit) { std::cout << "clean" << std::endl; }},
+    {"clean",
+     [](const Unit* unit) {
+         std::cout << "clean" << std::endl;
+         CompileCommands cc = unit->clean(false);
+         std::cout << cc << std::endl;
+         cc.execute();
+     }},
+    {"cleanall",
+     [](const Unit* unit) {
+         std::cout << "clean all" << std::endl;
+         CompileCommands cc = unit->clean(true);
+         std::cout << cc << std::endl;
+         cc.execute();
+     }},
     {"run",
      [](const Unit* unit) {
          std::cout << "run" << std::endl;
-         // auto [output, error_output, exit_code] = run_process(unit->get_target(), {});
+         auto [output, error_output, exit_code] = run_process(unit->get_target(), {});
          std::system(unit->get_target().c_str());
      }},
     {"rebuild", [](const Unit* unit) {
@@ -426,9 +440,26 @@ inline void Unit::parse(int argc, char** argv,
     std::vector<std::string> cmd_flags;
     cmd_flags.reserve(argc - 1);
 
+    bool nob_rebuild_present = false;
+    bool rebuild_present = false;
     for (int i = 1; i < argc; i++)
     {
-        cmd_flags.push_back(argv[i]);
+        std::string arg = argv[i];
+        if (arg == "nob_rebuild")
+        {
+            nob_rebuild_present = true;
+            continue;
+        }
+        if (arg == "rebuild")
+        {
+            rebuild_present = true;
+        }
+        cmd_flags.push_back(arg);
+    }
+
+    if (nob_rebuild_present && !rebuild_present)
+    {
+        cmd_flags.insert(cmd_flags.begin(), "rebuild");
     }
 
     if (cmd_flags.size() == 0)
@@ -438,6 +469,7 @@ inline void Unit::parse(int argc, char** argv,
 
     for (const std::string& cmd_flag : cmd_flags)
     {
+
         if (commands.contains(cmd_flag))
         {
             commands[cmd_flag](this);
@@ -474,6 +506,8 @@ inline int CompileCommand::execute() const
     {
         return 0;
     }
+
+    Timer timer;
     auto [output, error_output, exit_code] = run_process(command, args);
     if (exit_code != 0)
     {
@@ -487,6 +521,7 @@ inline int CompileCommand::execute() const
     {
         std::cout << "stderr: \n" << error_output << std::endl;
     }
+    std::cout << "Took: " << timer << std::endl;
     return exit_code;
 }
 
@@ -768,8 +803,7 @@ inline std::ostream& operator<<(std::ostream& os, CompileCommands compile_comman
 {
     for (size_t i = 0; i < compile_commands.cmds.size(); ++i)
     {
-        os << "#" << i << " " << compile_commands.cmds[i]
-           << " enabled=" << compile_commands.cmds[i].is_enabled() << "\n";
+        os << "#" << i << " " << compile_commands.cmds[i] << "\n";
     }
     return os;
 }
@@ -941,6 +975,29 @@ inline bool Unit::compile_impl(
     return false;
 }
 
+inline void Unit::clean_impl(CompileCommands& compile_commands) const
+{
+    for (const auto& dep : deps)
+    {
+        dep->clean_impl(compile_commands);
+    }
+    if (target_path)
+    {
+        compile_commands.add_cmd(CompileCommand(
+            "rm", {*target_path}, std::filesystem::exists(*target_path), false));
+
+        if (target_type == TargetType::OBJECT)
+        {
+
+            const auto dfile =
+                std::filesystem::path(*target_path).parent_path().string() + "/" +
+                std::filesystem::path(*target_path).stem().string() + ".d";
+            compile_commands.add_cmd(
+                CompileCommand("rm", {dfile}, std::filesystem::exists(dfile), false));
+        }
+    }
+}
+
 inline void Unit::apply_profile(const std::string& name, const Profile& profile)
 {
     active_profiles.insert(name);
@@ -1018,6 +1075,21 @@ inline CompileCommands Unit::compile(bool rebuild) const
 {
     CompileCommands compile_commands;
     compile_impl(compile_commands, target_type, rebuild, {});
+    return compile_commands;
+}
+
+inline CompileCommands Unit::clean(bool remove_dir = false) const
+{
+    CompileCommands compile_commands;
+    if (!remove_dir)
+    {
+        clean_impl(compile_commands);
+    }
+    else
+    {
+        compile_commands.add_cmd(CompileCommand("rm", {"-r", "build"},
+                                                std::filesystem::exists("build"), false));
+    }
     return compile_commands;
 }
 
