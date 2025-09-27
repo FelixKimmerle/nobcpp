@@ -5,12 +5,12 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
-#include <future>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -310,11 +310,14 @@ class CompileCommand
 class CompileCommands
 {
   private:
-    std::vector<std::vector<CompileCommand>> commands;
+    std::vector<CompileCommand> cmds;
+    std::vector<std::vector<int>> outs;
+    std::vector<int> in_degree;
 
   public:
-    void add_cmd(size_t depth, const CompileCommand& compile_command);
-    void execute() const;
+    int add_cmd(const CompileCommand& compile_command);
+    bool add_edge(int src, int dst);
+    void execute(int max_parallel = 0) const;
     void write() const;
     friend std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands);
 };
@@ -361,11 +364,12 @@ class Unit
     std::set<std::string> active_profiles;
     TargetType target_type;
     std::string compiler;
+    mutable std::optional<int> node_id;
 
     void print_depth_impl(int depth) const;
 
-    bool compile_impl(CompileCommands& compile_commands, int depth,
-                      TargetType target_type_parent, const bool full_rebuild,
+    bool compile_impl(CompileCommands& compile_commands, TargetType target_type_parent,
+                      const bool full_rebuild,
                       const std::vector<std::string>& inherited_compile_flags) const;
     void apply_profile(const std::string& name, const Profile& profile);
 
@@ -380,7 +384,7 @@ class Unit
     void add_compile_flags(const std::vector<std::string>& flags);
     void print_depth();
     void set_compiler(const std::string& compiler);
-    CompileCommands compile(bool rebuild, int depth = 0) const;
+    CompileCommands compile(bool rebuild) const;
     std::string get_target() const;
     void parse(int argc, char** argv,
                const std::unordered_map<std::string, Profile>& profiles = {});
@@ -411,6 +415,7 @@ static std::unordered_map<std::string, CmdCommand> commands = {
     {"rebuild", [](const Unit* unit) {
          std::cout << "rebuild" << std::endl;
          CompileCommands cc = unit->compile(true);
+         std::cout << cc << std::endl;
          cc.execute();
          cc.write();
      }}};
@@ -518,105 +523,254 @@ inline std::ostream& operator<<(std::ostream& os, const CompileCommand& cc)
 // CompileCommands
 // ----------------------------------------------------------------------------------
 
-inline void CompileCommands::add_cmd(size_t depth, const CompileCommand& compile_command)
+inline int CompileCommands::add_cmd(const CompileCommand& compile_command)
 {
-    // fill to the insertion depth (all depth - 1 should already be populated)
-    while (commands.size() <= depth)
-    {
-        commands.emplace_back();
-    }
-
-    commands[depth].push_back(compile_command);
+    int idx = static_cast<int>(cmds.size());
+    cmds.push_back(compile_command);
+    outs.emplace_back();
+    in_degree.push_back(0);
+    return idx;
 }
 
-inline void CompileCommands::execute() const
+inline bool CompileCommands::add_edge(int src, int dst)
 {
-    const int max_concurrent_jobs = std::thread::hardware_concurrency();
-    Semaphore sem(max_concurrent_jobs);
-    std::vector<std::future<int>> jobs;
-    Timer timer;
-
-    for (const auto& compile_level : std::views::reverse(commands))
+    if (src < 0 || dst < 0 || src >= (int)cmds.size() || dst >= (int)cmds.size())
     {
-        jobs.clear();
-        for (const auto& cmd : compile_level)
-        {
-            if (cmd.is_enabled())
-            {
-                sem.acquire(); // Wait for a slot
+        return false;
+    }
+    outs[src].push_back(dst);
+    in_degree[dst]++;
+    return true;
+}
 
-                jobs.push_back(std::async(std::launch::async, [&, cmd]() {
-                    std::cout << "Running: " << cmd << "\n";
-                    int result = cmd.execute();
-                    sem.release(); // Release slot when done
-                    return result;
-                }));
+inline void CompileCommands::execute(int max_parallel) const
+{
+
+    int P = max_parallel;
+    if (P <= 0)
+    {
+        unsigned hc = std::thread::hardware_concurrency();
+        P = hc == 0 ? 1 : static_cast<int>(hc);
+    }
+    if (P < 1)
+        P = 1;
+
+    const int n = static_cast<int>(cmds.size());
+    if (n == 0)
+    {
+        std::cout << "Compilation finished in: 0.00ms\n";
+        return;
+    }
+
+    // Working indegrees (atomic for concurrency)
+    std::vector<std::atomic<int>> indeg(n);
+    for (int i = 0; i < n; ++i)
+    {
+        int d = cmds[i].is_enabled() ? in_degree[i] : 0; // disabled = already done
+        indeg[i].store(d, std::memory_order_relaxed);
+    }
+
+    // Ready queue (MPMC via mutex+condvar)
+    struct Ready
+    {
+        mutable std::mutex m;
+        std::condition_variable cv;
+        std::queue<int> q;
+        void push(int t)
+        {
+            {
+                std::lock_guard<std::mutex> lk(m);
+                q.push(t);
+            }
+            cv.notify_one();
+        }
+
+        void notify_all()
+        {
+            cv.notify_all();
+        }
+        bool try_pop(int& t)
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (q.empty())
+                return false;
+            t = q.front();
+            q.pop();
+            return true;
+        }
+        bool wait_pop(int& t, std::atomic<int>& remaining, std::atomic<bool>& stop)
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] {
+                return !q.empty() || remaining.load(std::memory_order_acquire) == 0 ||
+                       stop.load(std::memory_order_relaxed);
+            });
+            if (!q.empty())
+            {
+                t = q.front();
+                q.pop();
+                return true;
+            }
+            return false;
+        }
+
+        bool empty() const
+        {
+            std::lock_guard<std::mutex> lk(m);
+            return q.empty();
+        }
+    } ready;
+
+    std::atomic<int> remaining{0};
+
+    // Seed: enabled with indegree 0; disabled propagate immediately
+    for (int i = 0; i < n; ++i)
+    {
+        if (cmds[i].is_enabled())
+        {
+            remaining.fetch_add(1, std::memory_order_relaxed);
+            if (indeg[i].load(std::memory_order_relaxed) == 0)
+            {
+                ready.push(i);
             }
         }
-        // Wait for all jobs in this level to finish
-        for (auto& job : jobs)
+        else
         {
-            if (job.get() != 0)
+            for (int d : outs[i])
             {
-                std::cerr << "Command failed.\n";
-                std::exit(1);
+                int newdeg = indeg[d].fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if (newdeg == 0 && cmds[d].is_enabled())
+                    ready.push(d);
             }
         }
     }
 
+    std::atomic<bool> stop{false};
+    std::atomic<int> failures{0};
+    Timer timer;
+
+    auto worker = [&]() {
+        while (true)
+        {
+
+            if (stop.load(std::memory_order_relaxed))
+                break;
+            if (remaining.load(std::memory_order_acquire) == 0 && ready.empty())
+                break;
+            int t = -1;
+            if (!ready.try_pop(t))
+            {
+
+                if (stop.load(std::memory_order_relaxed))
+                    break;
+                if (remaining.load(std::memory_order_acquire) == 0 && ready.empty())
+                    break;
+                if (!ready.wait_pop(t, remaining, stop))
+                {
+                    if (remaining.load(std::memory_order_acquire) == 0)
+                        break;
+                    if (stop.load(std::memory_order_relaxed))
+                        break;
+                    continue;
+                }
+            }
+
+            int code = 0;
+            try
+            {
+                std::cout << "Running: " << cmds[t] << "\n";
+                code = cmds[t].execute();
+            }
+            catch (...)
+            {
+                code = -1;
+            }
+
+            if (code != 0)
+            {
+                failures.fetch_add(1, std::memory_order_acq_rel);
+                stop.store(true, std::memory_order_release); // fail-fast
+                ready.notify_all();
+            }
+
+            for (int d : outs[t])
+            {
+                int newdeg = indeg[d].fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if (newdeg == 0 && cmds[d].is_enabled())
+                {
+                    ready.push(d);
+                }
+            }
+            // remaining.fetch_sub(1, std::memory_order_acq_rel);
+
+            int prev = remaining.fetch_sub(1, std::memory_order_acq_rel);
+            if (prev == 1)
+            {
+                // Just reached zero: wake all waiters so they can observe termination
+                ready.notify_all();
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(P));
+    for (int i = 0; i < P; ++i)
+        pool.emplace_back(worker);
+    for (auto& th : pool)
+        th.join();
+
+    if (failures.load(std::memory_order_relaxed) != 0)
+    {
+        std::cerr << "One or more commands failed.\n";
+        std::exit(1);
+    }
     std::cout << "Compilation finished in: " << timer << std::endl;
 }
 
 inline void CompileCommands::write() const
 {
-    std::vector<CompileCommand> filtered_commands;
-    for (const auto& cc : commands)
+
+    std::vector<CompileCommand> filtered;
+    filtered.reserve(cmds.size());
+    for (const auto& c : cmds)
     {
-        for (const auto& c : cc)
+        if (c.is_compile())
         {
-            if (c.is_compile())
-            {
-                filtered_commands.push_back(c);
-            }
+            filtered.push_back(c);
         }
     }
 
     std::ofstream out_file("compile_commands.json");
-    if (out_file)
+    if (!out_file)
     {
-        out_file << "[\n";
-        for (size_t i = 0; i < filtered_commands.size(); i++)
-        {
-            out_file << "\t{\n";
-            // std::cout << c << std::endl;
-            out_file << "\t\t\"directory\": \".\",\n";
-            out_file << "\t\t\"command\": \"";
-            filtered_commands[i].print(out_file);
-            out_file << "\",\n";
-            out_file << "\t\t\"file\":";
-            out_file << "\"" << filtered_commands[i].get_abs_file() << "\"";
-            out_file << "\n\t}";
-            if (i + 1 != filtered_commands.size())
-            {
-                out_file << ",\n";
-            }
-        }
-        out_file << "\n]\n";
+        return;
     }
+
+    out_file << "[\n";
+    for (size_t i = 0; i < filtered.size(); i++)
+    {
+        out_file << "\t{\n";
+        out_file << "\t\t\"directory\": \".\",\n";
+        out_file << "\t\t\"command\": \"";
+        filtered[i].print(out_file);
+        out_file << "\",\n";
+        out_file << "\t\t\"file\": \"" << filtered[i].get_abs_file() << "\"\n";
+        out_file << "\t}";
+        if (i + 1 != filtered.size())
+        {
+            out_file << ",\n";
+        }
+    }
+    out_file << "\n]\n";
 }
 
 inline std::ostream& operator<<(std::ostream& os, CompileCommands compile_commands)
 {
-    size_t level = 0;
-    for (const auto& cc : compile_commands.commands)
+    for (size_t i = 0; i < compile_commands.cmds.size(); ++i)
     {
-        std::cout << "Level: " << level++ << std::endl;
-        for (const auto& c : cc)
-        {
-            std::cout << c << std::endl;
-        }
+        os << "#" << i << " " << compile_commands.cmds[i]
+           << " enabled=" << compile_commands.cmds[i].is_enabled() << "\n";
     }
-
     return os;
 }
 
@@ -663,7 +817,7 @@ inline void Unit::print_depth_impl(int depth) const
 }
 
 inline bool Unit::compile_impl(
-    CompileCommands& compile_commands, int depth, TargetType target_type_parent,
+    CompileCommands& compile_commands, TargetType target_type_parent,
     const bool full_rebuild,
     const std::vector<std::string>& inherited_compile_flags) const
 {
@@ -694,7 +848,7 @@ inline bool Unit::compile_impl(
         {
             header_deps.push_back(*dep->source_path);
         }
-        bool rebuild = dep->compile_impl(compile_commands, depth + 1, target_type_parent,
+        bool rebuild = dep->compile_impl(compile_commands, target_type_parent,
                                          full_rebuild, local_compile_flags);
         parent_rebuild |= rebuild;
     }
@@ -732,8 +886,9 @@ inline bool Unit::compile_impl(
 
             args.insert(args.end(), {"-MMD", "-c", "-o", *target_path, *source_path});
             // .cpp -> .o compiling
-            compile_commands.add_cmd(
-                depth, CompileCommand(compiler, args, rebuild || full_rebuild, true));
+            int node = compile_commands.add_cmd(
+                CompileCommand(compiler, args, rebuild || full_rebuild, true));
+            node_id = node;
         }
         else
         {
@@ -767,11 +922,22 @@ inline bool Unit::compile_impl(
                                          std::filesystem::last_write_time(*target_path);
             }
 
-            compile_commands.add_cmd(
-                depth, CompileCommand(compiler, args, rebuild || full_rebuild, false));
+            int link_node = compile_commands.add_cmd(
+                CompileCommand(compiler, args, rebuild || full_rebuild, false));
+            node_id = link_node;
+
+            // Wire edges from each direct child’s node to this link/archive node
+            for (const auto& dep : deps)
+            {
+                if (dep->node_id.has_value())
+                {
+                    compile_commands.add_edge(dep->node_id.value(), link_node);
+                }
+            }
         }
         return rebuild;
     }
+    node_id.reset();
     return false;
 }
 
@@ -848,10 +1014,10 @@ inline void Unit::set_compiler(const std::string& compiler)
     }
 }
 
-inline CompileCommands Unit::compile(bool rebuild, int depth) const
+inline CompileCommands Unit::compile(bool rebuild) const
 {
     CompileCommands compile_commands;
-    compile_impl(compile_commands, depth, target_type, rebuild, {});
+    compile_impl(compile_commands, target_type, rebuild, {});
     return compile_commands;
 }
 
