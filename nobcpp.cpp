@@ -21,7 +21,6 @@ int main(int argc, char** argv /*, char** envp*/)
         build_tree_from_cpp_files("src/project_1/", "build/project_1/target");
 
     tree_1->add_dep(std::move(tree_2));
-    tree_1->add_compile_flags({"-Isrc/project_2"});
 
     std::cout << "Tree 1" << std::endl;
     tree_1->print_depth();
