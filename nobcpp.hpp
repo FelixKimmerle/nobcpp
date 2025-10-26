@@ -1,6 +1,7 @@
 #pragma once
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -359,6 +360,7 @@ class Unit
     std::vector<std::unique_ptr<Unit>> deps;
     std::optional<std::string> source_path;
     std::optional<std::string> target_path;
+    std::optional<std::string> root_path;
     std::vector<std::string> compile_flags;
     std::vector<std::string> link_flags;
     std::set<std::string> active_profiles;
@@ -376,7 +378,8 @@ class Unit
 
   public:
     Unit(const std::optional<std::string>& source_path,
-         const std::optional<std::string>& target_path = std::nullopt);
+         const std::optional<std::string>& target_path = std::nullopt,
+         const std::optional<std::string>& root_path = std::nullopt);
 
     void add_dep(std::unique_ptr<Unit> unit);
     void add_link_flag(const std::string& flag);
@@ -469,7 +472,6 @@ inline void Unit::parse(int argc, char** argv,
 
     for (const std::string& cmd_flag : cmd_flags)
     {
-
         if (commands.contains(cmd_flag))
         {
             commands[cmd_flag](this);
@@ -778,6 +780,7 @@ inline void CompileCommands::write() const
     std::ofstream out_file("compile_commands.json");
     if (!out_file)
     {
+        std::cerr << "Could not open compile_commands.json!" << std::endl;
         return;
     }
 
@@ -791,11 +794,21 @@ inline void CompileCommands::write() const
         out_file << "\",\n";
         out_file << "\t\t\"file\": \"" << filtered[i].get_abs_file() << "\"\n";
         out_file << "\t}";
-        if (i + 1 != filtered.size())
+        // if (i + 1 != filtered.size())
         {
             out_file << ",\n";
         }
     }
+    // write self for c++23 standard setting
+    out_file << "\t{\n";
+    out_file << "\t\t\"directory\": \".\",\n";
+    out_file << "\t\t\"command\": \"";
+    out_file << "c++ -std=c++23 -Wall -Wextra -Wpedantic -O3 -o nobcpp nobcpp.cpp";
+    out_file << "\",\n";
+    out_file << "\t\t\"file\": "
+             << std::filesystem::absolute(std::filesystem::path("nobcpp.cpp")) << "\n";
+    out_file << "\t}";
+
     out_file << "\n]\n";
 }
 
@@ -1006,9 +1019,10 @@ inline void Unit::apply_profile(const std::string& name, const Profile& profile)
 }
 
 inline Unit::Unit(const std::optional<std::string>& source_path,
-                  const std::optional<std::string>& target_path)
-    : source_path(source_path), target_path(target_path), target_type(TargetType::NONE),
-      compiler("c++")
+                  const std::optional<std::string>& target_path,
+                  const std::optional<std::string>& root_path)
+    : source_path(source_path), target_path(target_path), root_path(root_path),
+      target_type(TargetType::NONE), compiler("c++")
 {
     if (target_path)
     {
@@ -1034,6 +1048,10 @@ inline Unit::Unit(const std::optional<std::string>& source_path,
 
 inline void Unit::add_dep(std::unique_ptr<Unit> unit)
 {
+    if (unit->root_path)
+    {
+        add_compile_flag("-I" + *unit->root_path);
+    }
     deps.push_back(std::move(unit));
 }
 
@@ -1183,7 +1201,7 @@ inline std::vector<std::string> parse_dependency_file(
 inline std::unique_ptr<Unit> build_tree_from_cpp_files(
     const std::filesystem::path& root_dir, const std::filesystem::path& target)
 {
-    auto root = std::make_unique<Unit>(std::nullopt, target.string());
+    auto root = std::make_unique<Unit>(std::nullopt, target.string(), root_dir.string());
 
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root_dir))
     {
