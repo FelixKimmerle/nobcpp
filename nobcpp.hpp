@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -319,6 +320,7 @@ class Console
     std::string green(std::string_view t) const { return paint("1;32", t); }
     std::string yellow(std::string_view t) const { return paint("1;33", t); }
     std::string cyan(std::string_view t) const { return paint("36", t); }
+    std::string blue(std::string_view t) const { return paint("1;34", t); }
 
     // Atomically prints `text` above the status line.
     void print(std::string_view text)
@@ -778,15 +780,40 @@ inline std::vector<std::string> self_compile_command(const std::string& src,
 #endif
 }
 
+// Where the build script's source is. __FILE__ is baked into the binary when it is
+// compiled (absolute after a self-rebuild), so it would still point into the original
+// checkout after the folder was copied or moved. Only its file name is trusted: the
+// source is looked up next to the running binary first, then relative to the current
+// directory, and only then at the compiled in path.
+inline fs::path find_self_source(const std::string& source_filename, const fs::path& bin)
+{
+    std::error_code ec;
+    fs::path compiled_in(source_filename);
+    std::vector<fs::path> candidates = {bin.parent_path() / compiled_in.filename()};
+    if (compiled_in.is_relative())
+    {
+        candidates.push_back(fs::current_path(ec) / compiled_in);
+    }
+    candidates.push_back(compiled_in);
+    for (const auto& c : candidates)
+    {
+        if (fs::is_regular_file(c, ec))
+        {
+            return fs::absolute(c, ec).lexically_normal();
+        }
+    }
+    return fs::absolute(compiled_in, ec);
+}
+
 // Recompiles and restarts the build script if its source (or `deps`, relative to the
 // source's directory) is newer than the running binary.
 inline void rebuild_self(const std::string& source_filename, int argc, char** argv,
                          const std::vector<std::string>& deps = {})
 {
     std::error_code ec;
-    fs::path src = fs::absolute(source_filename, ec);
-    self_source_path() = src.string();
     fs::path bin = self_exe_path(argv[0]);
+    fs::path src = find_self_source(source_filename, bin);
+    self_source_path() = src.string();
     fs::path old_bin = bin.string() + ".old";
     fs::remove(old_bin, ec); // leftover from the previous rebuild (locked on Windows)
 
@@ -1292,6 +1319,18 @@ inline bool is_cpp_source(const fs::path& p)
     return exts.contains(p.extension().string());
 }
 
+inline std::vector<fs::path> find_files_all(const fs::path& dir)
+{
+    std::vector<fs::path> found;
+    std::error_code ec;
+    for (const auto& e : fs::recursive_directory_iterator(dir, ec))
+    {
+        if (e.is_regular_file()) found.push_back(e.path().lexically_normal());
+    }
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
 class Target
 {
   public:
@@ -1303,6 +1342,50 @@ class Target
     Flags flags;
     // For imported targets: where they come from (shown by 'tree').
     std::string origin;
+    // File name of the output instead of the platform default ("libfoo.so", "foo.exe").
+    std::string output_name;
+
+    struct Command
+    {
+        std::vector<std::string> args; // empty: copy inputs[0] to outputs[0]
+        std::vector<std::string> inputs;
+        std::vector<std::string> outputs;
+    };
+
+    // A build step nobcpp knows nothing about (shader compilers, code generators...):
+    // runs when an input changed, an output is missing or the command changed. It runs
+    // before this target's sources are compiled (so it can generate headers), and
+    // everything linking this target waits for it.
+    Target& add_command(std::vector<std::string> args, const std::vector<fs::path>& inputs,
+                        const std::vector<fs::path>& outputs)
+    {
+        Command c{std::move(args), {}, {}};
+        for (const auto& i : inputs) c.inputs.push_back(display_path(i));
+        for (const auto& o : outputs) c.outputs.push_back(display_path(o));
+        commands_.push_back(std::move(c));
+        return *this;
+    }
+
+    // Copies a file (e.g. a resource next to the executable), whenever it changed.
+    // A directory copies every file below it.
+    Target& add_copy(const fs::path& from, const fs::path& to)
+    {
+        if (fs::is_directory(from))
+        {
+            for (const auto& f : find_files_all(from))
+            {
+                add_copy(f, to / f.lexically_relative(from));
+            }
+            return *this;
+        }
+        commands_.push_back({{}, {display_path(from)}, {display_path(to)}});
+        return *this;
+    }
+
+    const std::vector<Command>& commands() const
+    {
+        return commands_;
+    }
     // Also applied to every target that (transitively) links this one:
     // include directories, defines and system libraries a user of this target needs.
     Flags public_flags;
@@ -1405,7 +1488,26 @@ class Target
     Kind kind_;
     std::vector<fs::path> sources_;
     std::vector<std::shared_ptr<Target>> deps_;
+    std::vector<Command> commands_;
 };
+
+// Files below `dir` with one of the extensions (".vert", ".frag"), sorted.
+inline std::vector<fs::path> find_files(const fs::path& dir, const std::set<std::string>& extensions,
+                                        bool recursive = true)
+{
+    std::vector<fs::path> found;
+    std::error_code ec;
+    auto consider = [&](const fs::directory_entry& e) {
+        if (e.is_regular_file() && extensions.contains(e.path().extension().string()))
+            found.push_back(e.path().lexically_normal());
+    };
+    if (recursive)
+        for (const auto& e : fs::recursive_directory_iterator(dir, ec)) consider(e);
+    else
+        for (const auto& e : fs::directory_iterator(dir, ec)) consider(e);
+    std::sort(found.begin(), found.end());
+    return found;
+}
 
 // ----------------------------------------------------------------------------------
 // Build cache: per output file the command hash, the time the command was started,
@@ -1580,7 +1682,8 @@ enum class JobType
 {
     Compile,
     Link,
-    Archive
+    Archive,
+    Command // Target::add_command
 };
 
 enum class JobState
@@ -1603,12 +1706,14 @@ struct Job
     std::vector<std::string> args;  // hashed, written to compile_commands.json
     std::vector<std::string> extra; // color flags, not hashed
     std::vector<std::string> inputs;
+    std::vector<std::string> extra_outputs; // commands may write several files
     std::vector<int> deps;
     std::vector<int> dependents;
 
     bool dirty = false;
     bool has_history = false;
-    double estimate = 1.0;
+    double estimate = 1.0;  // seconds, or relative weight if nothing was ever timed
+    uint64_t source_bytes = 0;
     double priority = 0.0; // estimate + longest chain of dependents (critical path)
 
     JobState state = JobState::UpToDate;
@@ -2412,6 +2517,51 @@ struct ImportedFlags
     }
 };
 
+// Compile time as a function of the source size: t = a * bytes^k, fitted in log space.
+// Measured on real projects k is small (~0.2): includes dominate, a file 10x larger
+// takes far less than 10x as long, so a linear "seconds per byte" is badly wrong.
+struct SizeModel
+{
+    double a = 0;
+    double k = 0;
+
+    bool valid() const
+    {
+        return a > 0;
+    }
+
+    double predict(double bytes) const
+    {
+        return a * std::pow(std::max(bytes, 1.0), k);
+    }
+
+    // samples: (bytes, seconds)
+    static SizeModel fit(const std::vector<std::pair<double, double>>& samples)
+    {
+        SizeModel m;
+        if (samples.empty()) return m;
+        double mx = 0, my = 0;
+        for (const auto& [b, t] : samples)
+        {
+            mx += std::log(std::max(b, 1.0));
+            my += std::log(std::max(t, 1e-3));
+        }
+        mx /= samples.size();
+        my /= samples.size();
+        double cov = 0, var = 0;
+        for (const auto& [b, t] : samples)
+        {
+            double dx = std::log(std::max(b, 1.0)) - mx;
+            cov += dx * (std::log(std::max(t, 1e-3)) - my);
+            var += dx * dx;
+        }
+        // few or similar sized samples: no trend, the (geometric) mean time per file
+        m.k = samples.size() >= 5 && var > 1e-6 ? std::clamp(cov / var, 0.0, 1.0) : 0.0;
+        m.a = std::exp(my - m.k * mx);
+        return m;
+    }
+};
+
 // ----------------------------------------------------------------------------------
 // Build
 // ----------------------------------------------------------------------------------
@@ -2448,8 +2598,17 @@ class Build
         }
         parse_options(argc, argv);
         console().configure(options_.color);
-        updating_ = std::find(options_.positionals.begin(), options_.positionals.end(),
-                              "update") != options_.positionals.end();
+        // 'update [names...]' moves tags and branches; it has to be known before the
+        // fetch() calls in the build script, they resolve the commits
+        auto update = std::find(options_.positionals.begin(), options_.positionals.end(), "update");
+        updating_ = update != options_.positionals.end();
+        if (updating_)
+        {
+            for (auto it = std::next(update); it != options_.positionals.end() && !is_command(*it); ++it)
+            {
+                update_names_.push_back(*it); // profile names are sorted out in resolve()
+            }
+        }
 
         profile("debug", {.opt = Opt::O0, .debug_info = true});
         profile("release", {.opt = Opt::O3, .debug_info = false, .defines = {"NDEBUG"}});
@@ -2519,6 +2678,20 @@ class Build
     // Imports a library installed on the system via pkg-config (gcc/clang only).
     std::shared_ptr<Target> pkg_config(const std::string& package, bool static_libs = false);
 
+    // A target that only runs commands (see Target::add_command), e.g. shaders.
+    std::shared_ptr<Target> custom(const std::string& name)
+    {
+        auto target = add_target(name, Kind::HeaderOnly, {});
+        target->origin = "custom commands";
+        return target;
+    }
+
+    // Where executables and libraries of the selected profiles end up, e.g. build/debug.
+    fs::path output_dir() const
+    {
+        return fs::path(build_dir) / join(requested_profiles(), "-");
+    }
+
     // The compiler selected via --cxx, $CXX or the platform default. Exits if it
     // cannot be found.
     const Toolchain& toolchain()
@@ -2577,6 +2750,9 @@ class Build
     std::vector<std::shared_ptr<CMakeDep>> cmake_deps_;
     bool deps_prepared_ = false;
     bool updating_ = false; // 'update': re-resolve tags and branches
+    std::vector<std::string> update_names_; // 'update a b': only these (and profiles)
+    std::set<std::string> fetched_names_;
+    std::set<fs::path> used_cache_dirs_;
     std::unique_ptr<Lockfile> lockfile_;
 
     std::string dependency_build_type() const;
@@ -2597,6 +2773,10 @@ class Build
     std::unordered_map<std::string, int> job_by_output_;
     std::unordered_map<const Target*, int> job_by_target_;
     std::set<const Target*> pic_targets_; // shared libs and everything linked into them
+    std::unordered_map<const Target*, std::vector<int>> command_jobs_;
+    std::unordered_map<std::string, double> seconds_by_display_;
+    bool timing_known_ = false;
+    std::optional<double> forecast_; // predicted wall time of the last execute() // estimates are seconds (else relative file size weights)
     int threads_used_ = 0;
     std::unordered_map<std::string, std::optional<fs::file_time_type>> mtimes_;
 
@@ -2607,12 +2787,13 @@ class Build
             {"rebuild", "clean the active profile, then build"},
             {"run", "build, then run an executable: run [target] [-- args...]"},
             {"clean", "remove the active profile's build directory"},
-            {"cleanall", "remove the whole build directory"},
+            {"cleanall", "remove the whole build directory, including the timing history"},
             {"compdb", "write compile_commands.json without building"},
             {"stats", "show how long each translation unit took to compile"},
             {"warnings", "replay stored warnings of all files: warnings [path filter...]"},
             {"tree", "show targets, sources and dependencies"},
-            {"update", "move fetched tags and branches to their latest commit (nobcpp.lock)"},
+            {"update", "move tags/branches of fetched dependencies to their latest commit: update [names...]"},
+            {"cleancache", "delete fetched sources not used for some days (default 30): cleancache [days]"},
             {"help", "show this help"},
         };
         return cmds;
@@ -2816,6 +2997,21 @@ class Build
             {
                 actions.back().filters.push_back(p);
             }
+            else if (!actions.empty() && actions.back().command == "update")
+            {
+                if (!fetched_names_.contains(p))
+                {
+                    usage_error("'" + p + "' is not a fetched dependency (fetched: " +
+                                join(std::vector<std::string>(fetched_names_.begin(), fetched_names_.end()), ", ") +
+                                ")");
+                }
+            }
+            else if (!actions.empty() && actions.back().command == "cleancache" &&
+                     actions.back().target.empty() && !p.empty() &&
+                     std::all_of(p.begin(), p.end(), [](char ch) { return std::isdigit(static_cast<unsigned char>(ch)); }))
+            {
+                actions.back().target = p;
+            }
             else
             {
                 usage_error("unknown command, profile or target '" + p + "'");
@@ -2870,7 +3066,8 @@ class Build
 
     fs::path output_path(const Target& t)
     {
-        return out_dir_ / toolchain().output_name(t.name(), t.kind());
+        return out_dir_ / (t.output_name.empty() ? toolchain().output_name(t.name(), t.kind())
+                                                 : t.output_name);
     }
 
     // ---------------------------------------------------------------- planning
@@ -2889,14 +3086,18 @@ class Build
     {
         for (int d : job.deps)
         {
-            if (jobs_[d].dirty) return true;
+            // commands only order jobs: their outputs are not inputs of a link, and
+            // generated headers are caught by the header dependencies like any other
+            if (jobs_[d].dirty && jobs_[d].type != JobType::Command) return true;
         }
         auto it = cache_.entries.find(job.output);
         if (it == cache_.entries.end() || it->second.hash != hash_args(job.args))
         {
             return true;
         }
-        if (!cached_mtime(job.output))
+        if (!cached_mtime(job.output) ||
+            std::any_of(job.extra_outputs.begin(), job.extra_outputs.end(),
+                        [&](const std::string& o) { return !cached_mtime(o); }))
         {
             return true;
         }
@@ -2915,6 +3116,14 @@ class Build
         if (auto it = cache_.entries.find(job.output); it != cache_.entries.end())
         {
             job.estimate = it->second.seconds;
+            job.has_history = true;
+        }
+        else if (auto by_source = seconds_by_display_.find(job.display);
+                 by_source != seconds_by_display_.end())
+        {
+            // same source, different output path (e.g. after nobcpp changed the object
+            // layout): its duration is still the best estimate
+            job.estimate = by_source->second;
             job.has_history = true;
         }
         job.dirty = is_dirty(job);
@@ -2959,15 +3168,40 @@ class Build
         collect_link_deps(t, link_deps, seen);
         std::reverse(link_deps.begin(), link_deps.end());
 
-        // global -> public flags of dependencies -> own flags -> profile
+        // global -> profile -> public flags of dependencies -> own flags: the more
+        // specific setting wins, like a target_compile_options() in CMake
         Flags f = flags;
+        f.merge(profile_flags_);
         for (auto it = link_deps.rbegin(); it != link_deps.rend(); ++it)
         {
             f.merge((*it)->public_flags);
         }
         f.merge(t.public_flags);
         f.merge(t.flags);
-        f.merge(profile_flags_);
+
+        std::vector<int> command_jobs;
+        for (const auto& cmd : t.commands())
+        {
+            if (cmd.outputs.empty())
+            {
+                console().error("a command of '" + t.name() + "' has no outputs");
+                std::exit(1);
+            }
+            Job job;
+            job.type = JobType::Command;
+            job.args = cmd.args;
+            job.inputs = cmd.inputs;
+            job.output = cmd.outputs[0];
+            job.extra_outputs.assign(cmd.outputs.begin() + 1, cmd.outputs.end());
+            job.display = cmd.inputs.empty() ? job.output : source_display_path(cmd.inputs[0]);
+            if (job_by_output_.contains(job.output))
+            {
+                console().error("'" + job.output + "' is the output of two commands");
+                std::exit(1);
+            }
+            command_jobs.push_back(add_job(std::move(job)));
+        }
+        command_jobs_[&t] = command_jobs;
 
         if (t.kind() == Kind::HeaderOnly)
         {
@@ -2980,7 +3214,7 @@ class Build
             return -1;
         }
 
-        std::vector<int> deps;
+        std::vector<int> deps = command_jobs;
         std::vector<std::string> inputs;
         for (const Target* dep : link_deps)
         {
@@ -2988,39 +3222,25 @@ class Build
             {
                 deps.push_back(id);
             }
-        }
-
-        // objects mirror the source tree below the deepest directory common to all sources
-        fs::path common;
-        for (const auto& src : t.sources())
-        {
-            fs::path dir = src.parent_path();
-            if (&src == &t.sources().front())
-            {
-                common = dir;
-                continue;
-            }
-            fs::path prefix;
-            auto a = common.begin();
-            for (auto b = dir.begin(); a != common.end() && b != dir.end() && *a == *b; ++a, ++b)
-            {
-                prefix /= *a;
-            }
-            common = prefix;
+            append(deps, command_jobs_[dep]);
         }
 
         bool pic = pic_targets_.contains(&t);
         for (const auto& src : t.sources())
         {
-            fs::path rel = src.lexically_relative(common);
-            if (rel.empty())
+            // Object paths only depend on the source's own path (relative to the project,
+            // or "imgui/..." for fetched sources), so adding or removing other files never
+            // moves objects (which would mean recompiling them and losing their timings).
+            fs::path rel = fs::path(source_display_path(src)).lexically_normal();
+            if (rel.is_absolute() || rel.has_root_name())
             {
-                rel = src.is_absolute() ? src.relative_path() : src;
+                rel = rel.relative_path();
             }
             std::string mangled;
             for (const auto& part : rel)
             {
                 std::string s = part.string();
+                if (s.empty() || s == ".") continue;
                 if (!mangled.empty()) mangled += "/";
                 mangled += s == ".." ? "__" : s;
             }
@@ -3033,6 +3253,7 @@ class Build
             job.depfile = job.output + ".d";
             job.args = tc.compile_command(f, job.source, job.output, job.depfile, pic);
             job.inputs = {job.source};
+            job.deps = command_jobs; // generated headers
             if (job_by_output_.contains(job.output))
             {
                 console().error("source '" + job.display + "' added twice to target '" +
@@ -3061,7 +3282,7 @@ class Build
             bool needs_rpath = false;
             for (const Target* dep : link_deps)
             {
-                if (dep->kind() == Kind::HeaderOnly)
+                if (dep->kind() == Kind::HeaderOnly) // nothing to link (commands, imports)
                 {
                     continue;
                 }
@@ -3087,9 +3308,15 @@ class Build
         jobs_.clear();
         job_by_output_.clear();
         job_by_target_.clear();
+        command_jobs_.clear();
         mtimes_.clear();
         cache_ = {};
         cache_.load(cache_path());
+        seconds_by_display_.clear();
+        for (const auto& [output, e] : cache_.entries)
+        {
+            seconds_by_display_[e.display] = e.seconds;
+        }
         pic_targets_.clear();
         std::function<void(const Target&)> mark_pic = [&](const Target& t) {
             if (pic_targets_.insert(&t).second)
@@ -3104,24 +3331,7 @@ class Build
             plan_target(*t);
         }
 
-        // unknown durations: average of the known ones of the same kind
-        double sums[2] = {0, 0};
-        int counts[2] = {0, 0};
-        for (const auto& j : jobs_)
-        {
-            int k = j.type == JobType::Compile ? 0 : 1;
-            if (j.has_history)
-            {
-                sums[k] += j.estimate;
-                counts[k]++;
-            }
-        }
-        for (auto& j : jobs_)
-        {
-            int k = j.type == JobType::Compile ? 0 : 1;
-            if (!j.has_history)
-                j.estimate = counts[k] ? sums[k] / counts[k] : (k == 0 ? 1.0 : 0.3);
-        }
+        estimate_unknown_durations();
         // jobs are created in dependency order, so walk backwards for critical paths
         for (int i = static_cast<int>(jobs_.size()) - 1; i >= 0; --i)
         {
@@ -3134,13 +3344,66 @@ class Build
         }
     }
 
+    // Files without a recorded time (new, or never compiled successfully) are estimated
+    // from their size with a model fitted to all timed files (see SizeModel). With no
+    // timing at all, estimates become relative weights (size^0.25) for the progress bar
+    // and no time is predicted until the build itself has timed some files.
+    void estimate_unknown_durations()
+    {
+        std::vector<std::pair<double, double>> samples;
+        double weight_sum = 0;
+        int compiles = 0;
+        for (auto& j : jobs_)
+        {
+            if (j.type != JobType::Compile) continue;
+            std::error_code ec;
+            uintmax_t size = fs::file_size(j.source, ec);
+            j.source_bytes = ec ? 0 : size;
+            weight_sum += std::pow(std::max<double>(j.source_bytes, 1.0), 0.25);
+            ++compiles;
+            if (j.has_history && j.source_bytes > 0) samples.emplace_back(j.source_bytes, j.estimate);
+        }
+        const SizeModel model = SizeModel::fit(samples);
+        timing_known_ = model.valid();
+        const double mean_weight = compiles ? weight_sum / compiles : 1.0;
+
+        // links, archives and commands without history: the average of their kind
+        double sums[2] = {0, 0};
+        int counts[2] = {0, 0};
+        for (const auto& j : jobs_)
+        {
+            if (j.type == JobType::Compile || !j.has_history) continue;
+            int k = j.type == JobType::Command ? 1 : 0;
+            sums[k] += j.estimate;
+            counts[k]++;
+        }
+        for (auto& j : jobs_)
+        {
+            const double bytes = std::max<double>(j.source_bytes, 1.0);
+            const double factor = j.type == JobType::Command ? 0.1 : 0.3; // relative to a compile
+            if (!timing_known_)
+            {
+                j.estimate = j.type == JobType::Compile ? std::pow(bytes, 0.25) : factor * mean_weight;
+                j.has_history = false;
+            }
+            else if (!j.has_history)
+            {
+                int k = j.type == JobType::Command ? 1 : 0;
+                if (j.type == JobType::Compile)
+                    j.estimate = model.predict(bytes);
+                else
+                    j.estimate = counts[k] ? sums[k] / counts[k] : factor * model.a;
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- execution
 
     std::vector<std::string> final_args(const Job& job) const
     {
         std::vector<std::string> args = job.args;
         // only the compiler driver understands them, `ar`/`lib` would choke on them
-        if (console().color() && job.type != JobType::Archive)
+        if (console().color() && (job.type == JobType::Compile || job.type == JobType::Link))
         {
             append(args, toolchain_->color_flags());
         }
@@ -3186,6 +3449,15 @@ class Build
         }
         job.stamp = file_clock_now();
         auto start = SteadyClock::now();
+        if (job.type == JobType::Command && job.args.empty())
+        {
+            fs::copy_file(job.inputs[0], job.output, fs::copy_options::overwrite_existing, ec);
+            job.result = {ec ? 1 : 0, ec ? "copying " + job.inputs[0] + " failed: " + ec.message() + "\n" : "", true};
+            job.seconds = seconds_since(start);
+            job.diagnostics = job.result.output;
+            job.errors = ec ? 1 : 0;
+            return;
+        }
         job.result = run_capture(final_args(job));
         job.seconds = seconds_since(start);
 
@@ -3294,13 +3566,19 @@ class Build
         bool stop = false;
         bool any_failed = false;
         double total_estimate = 0;
-        int with_history = 0;
         for (int i : todo)
         {
             total_estimate += jobs_[i].estimate;
-            with_history += jobs_[i].has_history;
         }
-        const bool use_history = with_history * 2 >= static_cast<int>(todo.size());
+        // seconds: time based progress and a remaining time, else file size weights
+        const bool use_history = timing_known_;
+        forecast_.reset();
+        if (use_history)
+        {
+            double critical = 0;
+            for (int i : todo) critical = std::max(critical, jobs_[i].priority);
+            forecast_ = std::max(total_estimate / std::max(1, parallel), critical);
+        }
         double done_estimate = 0;
         const int total = static_cast<int>(todo.size());
         const int width = static_cast<int>(std::to_string(total).size());
@@ -3440,7 +3718,7 @@ class Build
             if (j.state == JobState::Running)
             {
                 double elapsed = std::chrono::duration<double>(now - j.started).count();
-                done += std::min(elapsed, j.estimate * 0.95);
+                if (use_history) done += std::min(elapsed, j.estimate * 0.95);
                 critical = std::max(critical, j.priority - elapsed);
                 running.emplace_back(j.started, short_name(j));
                 ++remaining;
@@ -3451,8 +3729,67 @@ class Build
                 ++remaining;
             }
         }
-        double fraction = use_history ? done / std::max(total_estimate, 1e-9)
-                                      : static_cast<double>(finished) / total;
+        double elapsed_total = seconds_since(start);
+        std::optional<double> eta;
+        bool from_sizes = false; // part of the forecast is estimated from file sizes
+        if (use_history)
+        {
+            eta = std::max((total_estimate - done) / std::max(1, std::min(parallel, remaining)),
+                           critical);
+            for (int i : todo)
+            {
+                const Job& j = jobs_[i];
+                if ((j.state == JobState::Pending || j.state == JobState::Running) && !j.has_history)
+                    from_sizes = true;
+            }
+        }
+        else
+        {
+            // Nothing was timed before: once enough files compiled, fit the size model to
+            // this build and extrapolate. The first files to finish are the fast ones, so
+            // running jobs count too: one that has run for 10s takes at least that long.
+            std::vector<std::pair<double, double>> samples;
+            int compiles = 0;
+            for (int i : todo)
+            {
+                const Job& j = jobs_[i];
+                if (j.type != JobType::Compile) continue;
+                ++compiles;
+                if (j.state == JobState::Done && j.source_bytes > 0)
+                    samples.emplace_back(j.source_bytes, j.seconds);
+            }
+            if (samples.size() >= 3 && static_cast<int>(samples.size()) * 4 >= compiles)
+            {
+                const SizeModel model = SizeModel::fit(samples);
+                double link_estimate = 0;
+                for (const auto& [b, t] : samples) link_estimate += t;
+                link_estimate = 0.3 * link_estimate / samples.size();
+                double work = 0, longest = 0;
+                for (int i : todo)
+                {
+                    const Job& j = jobs_[i];
+                    if (j.state != JobState::Pending && j.state != JobState::Running) continue;
+                    double expected = j.type == JobType::Compile ? model.predict(j.source_bytes)
+                                                                 : link_estimate;
+                    double left = expected;
+                    if (j.state == JobState::Running)
+                    {
+                        double ran = std::chrono::duration<double>(now - j.started).count();
+                        // past its prediction: nobody knows how long it still takes, assume
+                        // a part of what it already ran (long jobs tend to stay long)
+                        left = expected > ran ? expected - ran : 0.3 * ran;
+                    }
+                    work += left;
+                    longest = std::max(longest, left);
+                }
+                eta = std::max(work / std::max(1, std::min(parallel, remaining)), longest);
+                from_sizes = true;
+            }
+        }
+        // with a forecast: the share of the expected wall time that has passed, so the bar
+        // and the remaining time agree; else the share of the (file size weighted) work
+        double fraction = use_history && eta ? elapsed_total / std::max(elapsed_total + *eta, 1e-9)
+                                             : done / std::max(total_estimate, 1e-9);
         fraction = std::clamp(fraction, 0.0, 1.0);
 
         const int bar_width = 24;
@@ -3464,17 +3801,14 @@ class Build
         std::snprintf(pct, sizeof(pct), "%3d%%", static_cast<int>(fraction * 100));
         std::string status = c.dim("[" + std::to_string(finished) + "/" +
                                    std::to_string(total) + "] ") +
-                             (any_failed ? c.red(bar) : c.green(bar)) + " " + pct;
-        if (use_history)
+                             (any_failed ? c.red(bar) : c.green(bar)) + " " + pct + "  " +
+                             format_duration(elapsed_total);
+        if (eta)
         {
-            double eta = std::max((total_estimate - done) /
-                                      std::max(1, std::min(parallel, remaining)),
-                                  critical);
-            status += c.dim("  ~" + format_duration(std::max(eta, 0.0)) + " left");
-        }
-        else
-        {
-            status += c.dim("  " + format_duration(seconds_since(start)));
+            // blue: from recorded times, yellow: (partly) estimated from file sizes
+            std::string forecast = "~" + format_duration(std::max(*eta, 0.0)) + " left (≈" +
+                                   format_duration(elapsed_total + std::max(*eta, 0.0)) + ")";
+            status += "  " + (from_sizes ? c.paint("33", forecast) : c.blue(forecast));
         }
         std::sort(running.begin(), running.end());
         std::vector<std::string> names;
@@ -3505,9 +3839,21 @@ class Build
     void update_cache()
     {
         // forget outputs that are no longer part of the build (renamed sources, ...)
+        // and delete their objects, only ever inside this profile's obj/ directory
+        const std::string obj_dir = (out_dir_ / "obj").generic_string() + "/";
         for (auto it = cache_.entries.begin(); it != cache_.entries.end();)
         {
-            it = job_by_output_.contains(it->first) ? std::next(it) : cache_.entries.erase(it);
+            if (job_by_output_.contains(it->first))
+            {
+                ++it;
+                continue;
+            }
+            if (it->first.starts_with(obj_dir))
+            {
+                std::error_code ec;
+                fs::remove(it->first, ec);
+            }
+            it = cache_.entries.erase(it);
         }
         for (const auto& j : jobs_)
         {
@@ -3531,7 +3877,13 @@ class Build
             }
             else if (j.state == JobState::Failed)
             {
-                cache_.entries.erase(j.output); // never treat a failed output as current
+                // never treat a failed output as current, but keep the duration of the
+                // last successful run: a failed run says nothing about the real time
+                if (auto it = cache_.entries.find(j.output); it != cache_.entries.end())
+                {
+                    it->second.hash = 0;
+                    it->second.diagnostics.clear();
+                }
             }
         }
         cache_.save(cache_path());
@@ -3690,6 +4042,10 @@ class Build
         }
         s += c.green("✓ ") + profile + ": built " + std::to_string(built) + "/" +
              std::to_string(jobs_.size()) + " jobs in " + c.bold(format_duration(wall));
+        if (forecast_)
+        {
+            s += c.dim(" (forecast " + format_duration(*forecast_) + ")");
+        }
         if (wall > 0.05)
         {
             char buf[64];
@@ -3789,11 +4145,120 @@ class Build
         return ok;
     }
 
+    // The commits were already resolved by the fetch() calls. A full update also drops
+    // lockfile entries of dependencies the build script doesn't fetch anymore (only
+    // then: a dependency fetched conditionally, e.g. only if Python is installed, must
+    // keep its pin during normal builds on other machines).
+    void cmd_update()
+    {
+        auto& c = console();
+        std::vector<std::string> names;
+        for (const auto& n : update_names_)
+        {
+            if (fetched_names_.contains(n)) names.push_back(n);
+        }
+        if (names.empty() && fs::exists("nobcpp.lock"))
+        {
+            if (!lockfile_) lockfile_ = std::make_unique<Lockfile>("nobcpp.lock");
+            for (auto it = lockfile_->entries.begin(); it != lockfile_->entries.end();)
+            {
+                if (fetched_names_.contains(it->first))
+                {
+                    ++it;
+                    continue;
+                }
+                c.println(c.cyan("nobcpp.lock: ") + "removed " + it->first + c.dim(" (not fetched anymore)"));
+                it = lockfile_->entries.erase(it);
+            }
+            lockfile_->save();
+        }
+        c.println(c.green("✓ ") + (names.empty() ? std::string("all fetched dependencies") : join(names, ", ")) +
+                  " at the latest commit of their tag or branch (nobcpp.lock)");
+    }
+
+    static uintmax_t directory_size(const fs::path& dir)
+    {
+        uintmax_t size = 0;
+        std::error_code ec;
+        for (const auto& e : fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied, ec))
+        {
+            if (e.is_regular_file(ec)) size += e.file_size(ec);
+        }
+        return size;
+    }
+
+    static std::string format_bytes(double bytes)
+    {
+        const char* units[] = {"B", "KB", "MB", "GB"};
+        int u = 0;
+        while (bytes >= 1024 && u < 3)
+        {
+            bytes /= 1024;
+            ++u;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.1f %s", bytes, units[u]);
+        return buf;
+    }
+
+    // Deletes fetched sources that no project used for `days` days. The cache is shared
+    // by all projects; sources of this one are always kept.
+    void cmd_cleancache(int days)
+    {
+        auto& c = console();
+        fs::path root = source_cache_dir();
+        std::error_code ec;
+        const auto now = fs::file_time_type::clock::now();
+        const auto max_age = std::chrono::hours(24) * days;
+        uintmax_t freed = 0;
+        int removed = 0, kept = 0;
+        std::vector<fs::path> dirs;
+        for (const auto& e : fs::directory_iterator(root, ec))
+        {
+            if (e.is_directory(ec)) dirs.push_back(e.path());
+        }
+        for (const auto& dir : dirs)
+        {
+            bool partial = dir.filename().string().find(".tmp-") != std::string::npos;
+            auto used = file_mtime(dir.string() + ".used");
+            if (!used) used = file_mtime(dir);
+            bool old = used && now - *used > (partial ? std::chrono::hours(24) : max_age);
+            if (used_cache_dirs_.contains(dir) || !old)
+            {
+                ++kept;
+                continue;
+            }
+            freed += directory_size(dir);
+            fs::remove_all(dir, ec);
+            fs::remove(dir.string() + ".used", ec);
+            ++removed;
+            c.println(c.dim("  removed " + dir.filename().string()));
+        }
+        c.println(c.green("✓ ") + "removed " + std::to_string(removed) + " cached source" +
+                  (removed == 1 ? "" : "s") + " (" + format_bytes(static_cast<double>(freed)) + "), kept " +
+                  std::to_string(kept) + " in " + display_path(root));
+    }
+
     bool cmd_clean(bool all)
     {
         fs::path dir = all ? fs::path(build_dir) : out_dir_;
+        // 'clean' and 'rebuild' keep the timing history: exactly then every time is known
+        Cache timings;
+        if (!all)
+        {
+            timings.load(cache_path());
+            for (auto& [output, e] : timings.entries)
+            {
+                e.hash = 0; // outdated, only the duration is still useful
+                e.diagnostics.clear();
+            }
+        }
         std::error_code ec;
         auto removed = fs::remove_all(dir, ec);
+        if (!ec && !timings.entries.empty())
+        {
+            timings.save(cache_path());
+        }
         if (ec)
         {
             console().error("could not remove '" + display_path(dir) + "': " + ec.message());
@@ -3971,8 +4436,19 @@ class Build
                      " jobs one after another, what a build with -j1 takes");
         if (recorded.size() < jobs_.size())
         {
+            std::vector<std::string> names;
+            for (const auto& j : jobs_)
+            {
+                if (!j.has_history) names.push_back(short_name(j));
+            }
+            if (names.size() > 4)
+            {
+                names.resize(4);
+                names.push_back("...");
+            }
             s += indent + c.dim(std::to_string(jobs_.size() - recorded.size()) +
-                                " jobs have no recorded time yet and are estimated") + "\n";
+                                " jobs have no recorded time yet and are estimated from their file size (" +
+                                join(names, ", ") + ")") + "\n";
         }
         if (const auto& r = cache_.last_full_build)
         {
@@ -4149,8 +4625,11 @@ inline int Build::run()
         }
         else if (cmd == "update")
         {
-            console().println(console().green("✓ ") + "fetched dependencies are at the latest "
-                              "commit of their tag or branch (nobcpp.lock)");
+            cmd_update();
+        }
+        else if (cmd == "cleancache")
+        {
+            cmd_cleancache(action.target.empty() ? 30 : std::stoi(action.target));
         }
         else if (cmd == "run")
         {
@@ -4196,7 +4675,10 @@ inline std::shared_ptr<Fetched> Build::fetch(const std::string& name, const Sour
             auto it = lockfile_->entries.find(name);
             bool locked = it != lockfile_->entries.end() && it->second.url == source.git &&
                           it->second.ref == ref;
-            if (locked && !updating_)
+            bool update_this = updating_ && (update_names_.empty() ||
+                                             std::find(update_names_.begin(), update_names_.end(), name) !=
+                                                 update_names_.end());
+            if (locked && !update_this)
             {
                 commit = it->second.commit;
             }
@@ -4250,6 +4732,10 @@ inline std::shared_ptr<Fetched> Build::fetch(const std::string& name, const Sour
                   c.dim(" in " + format_duration(seconds_since(start)) + " → " +
                         display_path(dir)));
     }
+    // remember the use, 'cleancache' only deletes sources no project used for a while
+    fetched_names_.insert(name);
+    used_cache_dirs_.insert(dir);
+    std::ofstream(dir.string() + ".used", std::ios::trunc) << fs::current_path().generic_string() << "\n";
     return std::make_shared<Fetched>(name, source, version, dir);
 }
 

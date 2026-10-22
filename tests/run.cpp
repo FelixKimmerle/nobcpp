@@ -141,6 +141,12 @@ class Tests
         return dir_;
     }
 
+    // Continues the current test in another directory (e.g. a copy of the project).
+    void set_dir(const fs::path& dir)
+    {
+        dir_ = dir;
+    }
+
   private:
     int failed_ = 0;
 
@@ -212,6 +218,82 @@ int main(int argc, char** argv)
                  "a broken build script fails with exit code 1");
         t.replace("nobcpp.cpp", "b.flags.std = 20 +;", "b.flags.std = 20;");
         t.expect(t.nob({"help"}), 0, {"usage:"}, {}, "and recovers once fixed");
+    }
+
+    if (t.begin("commands", "examples/01_basic"))
+    {
+        t.replace("nobcpp.cpp", "    return b.run();",
+                  "    auto assets = b.custom(\"assets\");\n"
+                  "    assets->add_copy(\"src/greeter\", b.output_dir() / \"assets\");\n"
+                  "    assets->add_command({\"cmake\", \"-E\", \"copy\", \"src/app/main.cpp\",\n"
+                  "                         (b.output_dir() / \"main.copy\").string()},\n"
+                  "                        {\"src/app/main.cpp\"}, {b.output_dir() / \"main.copy\"});\n"
+                  "    app->link(assets);\n"
+                  "    greeter->flags.opt = nob::Opt::O2;\n"
+                  "    return b.run();");
+        t.expect(t.nob({"-v", "run"}), 0,
+                 {"Hello, nobcpp!", "-O2 -g -Wall", "-O0 -g -Wall"}, {},
+                 "target flags override the profile (-O2 for greeter, -O0 elsewhere)");
+        bool copied = fs::exists(t.dir() / "build/debug/assets/greeter.hpp") &&
+                      fs::exists(t.dir() / "build/debug/assets/greeter.cpp") &&
+                      fs::exists(t.dir() / "build/debug/main.copy");
+        t.check(copied, "copies and commands produce their outputs");
+        t.expect(t.nob({}), 0, {"everything up to date"}, {}, "and are not rerun");
+        t.touch("src/greeter/greeter.hpp");
+        t.expect(t.nob({}), 0, {"src/greeter/greeter.hpp", "src/greeter/greeter.cpp"},
+                 {"main.copy"}, "a changed input reruns only its copy");
+        t.touch("src/app/main.cpp");
+        t.expect(t.nob({}), 0, {"src/app/main.cpp", "built 3/"}, {},
+                 "a command reruns without forcing extra relinks");
+    }
+
+    if (t.begin("timing", "examples/01_basic"))
+    {
+        t.expect(t.nob({}), 0, {"built 5/5"}, {}, "first build records the job times");
+        t.expect(t.nob({"clean"}), 0, {"removed build/debug"}, {}, "clean");
+        t.expect(t.nob({"stats"}), 0, {"src/app/main.cpp", "sum of job times"},
+                 {"no timing data", "no recorded time"}, "the timing history survives 'clean'");
+        t.expect(t.nob({"rebuild"}), 0, {"built 5/5"}, {}, "and 'rebuild' builds everything");
+
+        t.write("src/app/main.cpp", "int main() { return undefined_thing; }\n");
+        t.expect(t.nob({}), 1, {"build failed"}, {}, "a failing compile");
+        t.expect(t.nob({"stats"}), 0, {"src/app/main.cpp", "sum of job times"}, {"no recorded time"},
+                 "keeps the last successful time of the file");
+        t.write("src/app/main.cpp", "#include \"greeter.hpp\"\n#include <iostream>\n"
+                                    "int main() { std::cout << greet(\"again\") << \"\\n\"; }\n");
+
+        t.write("src/extra.cpp", "int extra() { return 1; }\n");
+        t.replace("nobcpp.cpp", "    app->link(greeter);", "    app->link(greeter);\n    app->add_source(\"src/extra.cpp\");");
+        t.expect(t.nob({"stats"}), 0, {"1 jobs have no recorded time yet and are estimated from their file size (extra.cpp)"},
+                 {}, "a new file is estimated from its size, the other objects keep their place and time");
+
+        t.expect(t.nob({}), 0, {"src/extra.cpp"}, {}, "the new file is built");
+        t.replace("nobcpp.cpp", "\n    app->add_source(\"src/extra.cpp\");", "");
+        t.expect(t.nob({}), 0, {"debug: built"}, {}, "and removed from the build again");
+        t.check(!fs::exists(t.dir() / "build/debug/obj/app/src/extra.cpp.o") &&
+                    fs::exists(t.dir() / "build/debug/obj/app/src/app/main.cpp.o"),
+                "the object of a removed source is deleted, the others stay");
+        t.expect(t.nob({"cleanall"}), 0, {"removed build"}, {}, "cleanall");
+        t.expect(t.nob({"stats"}), 0, {"no timing data"}, {}, "removes the history too");
+    }
+
+    if (t.begin("copied", "examples/01_basic"))
+    {
+        // the bootstrap compiles with an absolute path, like a self-rebuild does, so
+        // __FILE__ in the binary points at this directory
+        t.expect(t.nob({}), 0, {"built 5/5"}, {}, "original builds");
+        fs::path original = t.dir();
+        fs::path copy = original.parent_path() / "copied_moved";
+        std::error_code ec;
+        fs::remove_all(copy, ec);
+        fs::copy(original, copy, fs::copy_options::recursive);
+        t.set_dir(copy);
+        t.replace("nobcpp.cpp", "    return b.run();", "    // edited in the copy\n    return b.run();");
+        t.expect(t.nob({"help"}), 0, {"rebuilding", "usage:"}, {},
+                 "a copied checkout rebuilds when its own build script changes");
+        t.set_dir(original);
+        t.expect(t.nob({}), 0, {"everything up to date"}, {"rebuilding"},
+                 "and the original is not affected");
     }
 
     if (t.begin("shared_lib", "examples/02_shared_lib"))
@@ -328,6 +410,38 @@ int main(int argc, char** argv)
                   ".targets = {\"greetlib::greetlib\"}, .options = {\"GREETLIB_LOUD=ON\"}");
         t.expect(t.nob({"run"}), 0, {"fetching greetlib", "ready in", "HELLO FROM GREETLIB v2"}, {},
                  "changing a cmake option rebuilds the dependency");
+
+        // updates by name, stale lockfile entries, cache cleanup
+        {
+            std::ofstream(t.dir() / "nobcpp.lock", std::ios::app) << "ghost\thttps://example.invalid/ghost\tmain\t"
+                                                                    << std::string(40, 'a') << "\n";
+        }
+        git({"commit", "-q", "--allow-empty", "-m", "v3"});
+        std::string v3 = git({"rev-parse", "HEAD"});
+        t.expect(t.nob({"update", "greetlib"}), 0,
+                 {"nobcpp.lock: greetlib main → " + v3.substr(0, 12), "greetlib at the latest commit"}, {},
+                 "'update <name>' updates that dependency");
+        auto lock2 = nob::read_file(t.dir() / "nobcpp.lock");
+        t.check(lock2 && lock2->find("ghost") != std::string::npos,
+                "'update <name>' keeps other entries", lock2.value_or(""));
+        t.expect(t.nob({"update", "nope"}), 2, {"'nope' is not a fetched dependency (fetched: greetlib)"}, {},
+                 "'update' rejects unknown names");
+        t.expect(t.nob({"update"}), 0, {"nobcpp.lock: removed ghost", "all fetched dependencies"}, {},
+                 "'update' removes entries of dependencies that are not fetched anymore");
+
+        fs::path old_src = cache / "src" / "oldlib-0123456789ab";
+        fs::create_directories(old_src);
+        std::ofstream(old_src / "big.txt") << std::string(10000, 'x');
+        fs::last_write_time(old_src, fs::file_time_type::clock::now() - std::chrono::hours(24 * 40));
+        // the earlier greetlib commit was used minutes ago: kept by default, deleted by
+        // 'cleancache 0', the current commit's sources are always kept
+        fs::path current_src = cache / "src" / ("greetlib-" + v3.substr(0, 12));
+        t.expect(t.nob({"cleancache"}), 0, {"removed oldlib-0123456789ab", "removed 1 cached source", "kept 2"}, {},
+                 "'cleancache' deletes sources unused for 30 days");
+        t.check(!fs::exists(old_src) && fs::exists(current_src), "the old source is gone, the current one stays");
+        t.expect(t.nob({"cleancache", "0"}), 0, {"removed 1 cached source", "kept 1"}, {"removed greetlib-" + v3.substr(0, 12)},
+                 "'cleancache 0' deletes everything this project doesn't use");
+        t.check(fs::exists(current_src), "sources of the current project are never deleted");
 
         t.replace("nobcpp.cpp", "greetlib::greetlib\"}", "greetlib::nope\"}");
         t.expect(t.nob({}), 1, {"dependency greetlib", "cmake import failed", "full log:"}, {},
