@@ -1,0 +1,4 @@
+# nobcpp.lock: the exact commits of fetched dependencies, commit this file.
+# './nobcpp update' moves tags and branches to their current commit.
+SDL3	https://github.com/libsdl-org/SDL	release-3.4.18	829a65d769d935c4852f8159e964312c0957260a
+imgui	https://github.com/ocornut/imgui	docking	d88f238d1d363ef387382b2e29ad12cf96f826ac

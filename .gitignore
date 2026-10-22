@@ -1,6 +1,15 @@
-/nobcpp
-/build/
+# build script binaries (nobcpp.old is the previous one, kept during a self-rebuild)
+nobcpp
+nobcpp.old
+nobcpp.exe
+nobcpp.exe.old
+nobcpp.obj
+build/
+compile_commands.json
+/tests/run
+/tests/run.old
+/tests/run.exe
+/tests/tmp/
 /.vscode
 /.clang-format
-/compile_commands.json
 /.cache

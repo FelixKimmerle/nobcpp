@@ -1,0 +1,1 @@
+#define GREETLIB_VERSION "v1"
